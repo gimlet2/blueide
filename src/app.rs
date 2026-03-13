@@ -31,9 +31,12 @@ pub enum FocusArea {
 #[derive(Debug, Clone)]
 pub enum Dialog {
     Help,
+    About,
     OpenFile { input: String },
     SaveAs { input: String },
     Find { input: String, from_row: usize },
+    Replace { find: String, replace_with: String, from_row: usize, focus_replace: bool },
+    GoToLine { input: String },
     Message { text: String },
     Hover { text: String },
 }
@@ -72,6 +75,84 @@ pub struct HelpLine {
 }
 
 // ---------------------------------------------------------------------------
+// Submenu data — Turbo Pascal style dropdown entries
+// ---------------------------------------------------------------------------
+
+/// One entry in a dropdown submenu.  An empty `label` renders as a separator.
+pub struct SubMenuItem {
+    pub label: &'static str,
+    pub shortcut: &'static str,
+}
+
+impl SubMenuItem {
+    pub fn is_separator(&self) -> bool {
+        self.label.is_empty()
+    }
+}
+
+const FILE_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "New",         shortcut: ""        },
+    SubMenuItem { label: "Open...",     shortcut: "F3"      },
+    SubMenuItem { label: "Save",        shortcut: "F2"      },
+    SubMenuItem { label: "Save As...",  shortcut: ""        },
+    SubMenuItem { label: "",            shortcut: ""        },
+    SubMenuItem { label: "Exit",        shortcut: "Alt+X"   },
+];
+
+const EDIT_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Undo",        shortcut: "Ctrl+Z"  },
+    SubMenuItem { label: "Redo",        shortcut: "Ctrl+Y"  },
+    SubMenuItem { label: "",            shortcut: ""        },
+    SubMenuItem { label: "Cut",         shortcut: "Ctrl+X"  },
+    SubMenuItem { label: "Copy",        shortcut: "Ctrl+Ins"},
+    SubMenuItem { label: "Paste",       shortcut: "Shft+Ins"},
+    SubMenuItem { label: "",            shortcut: ""        },
+    SubMenuItem { label: "Select All",  shortcut: "Ctrl+A"  },
+];
+
+const SEARCH_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Find...",       shortcut: "Ctrl+F"  },
+    SubMenuItem { label: "Replace...",    shortcut: "Ctrl+H"  },
+    SubMenuItem { label: "Find Again",    shortcut: "Ctrl+L"  },
+    SubMenuItem { label: "",             shortcut: ""         },
+    SubMenuItem { label: "Go to Line...", shortcut: "Ctrl+G"  },
+];
+
+const RUN_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Run",           shortcut: "F5"  },
+    SubMenuItem { label: "Compile",       shortcut: "F9"  },
+    SubMenuItem { label: "",             shortcut: ""     },
+    SubMenuItem { label: "Parameters...", shortcut: ""    },
+];
+
+const OPTIONS_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Compiler...",    shortcut: "" },
+    SubMenuItem { label: "Environment...", shortcut: "" },
+    SubMenuItem { label: "",              shortcut: ""  },
+    SubMenuItem { label: "Save Settings", shortcut: "" },
+];
+
+const WINDOW_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Toggle File Browser", shortcut: "Ctrl+B" },
+    SubMenuItem { label: "",                    shortcut: ""       },
+    SubMenuItem { label: "Refresh Display",     shortcut: ""       },
+    SubMenuItem { label: "Close",               shortcut: "Alt+F3" },
+];
+
+const HELP_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Contents",     shortcut: "F1"       },
+    SubMenuItem { label: "Index",        shortcut: "Shft+F1"  },
+    SubMenuItem { label: "Topic Search", shortcut: ""         },
+    SubMenuItem { label: "",            shortcut: ""          },
+    SubMenuItem { label: "About...",    shortcut: ""          },
+];
+
+/// Indexed by menu_index (0 = File … 6 = Help).
+pub const SUBMENUS: &[&[SubMenuItem]] = &[
+    FILE_MENU, EDIT_MENU, SEARCH_MENU, RUN_MENU, OPTIONS_MENU, WINDOW_MENU, HELP_MENU,
+];
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -79,6 +160,10 @@ pub struct App {
     pub editor: Editor,
     pub focus: FocusArea,
     pub menu_index: usize,
+    /// Whether a dropdown submenu is currently open.
+    pub submenu_open: bool,
+    /// Selected item index within the open submenu.
+    pub submenu_index: usize,
     pub show_tree: bool,
     pub tree_entries: Vec<TreeEntry>,
     pub tree_selected: usize,
@@ -87,6 +172,10 @@ pub struct App {
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
     pub lsp_available: bool,
     pub status_msg: Option<String>,
+    /// Internal line clipboard (copy/cut line operations).
+    pub clipboard: String,
+    /// Last search needle (for Find Again).
+    pub last_needle: String,
     lsp: LspClient,
     root_path: PathBuf,
 }
@@ -112,6 +201,8 @@ impl App {
             editor,
             focus: FocusArea::Editor,
             menu_index: 0,
+            submenu_open: false,
+            submenu_index: 0,
             show_tree: true,
             tree_entries,
             tree_selected: 0,
@@ -120,6 +211,8 @@ impl App {
             diagnostics: HashMap::new(),
             lsp_available: false,
             status_msg: None,
+            clipboard: String::new(),
+            last_needle: String::new(),
             lsp,
             root_path,
         })
@@ -280,6 +373,7 @@ impl App {
             KeyCode::F(10) => {
                 self.focus = FocusArea::Menu;
                 self.menu_index = 0;
+                self.submenu_open = false;
             }
 
             // ---- File browser toggle ----
@@ -298,9 +392,29 @@ impl App {
             // ---- Find ----
             KeyCode::Char('f') if ctrl => {
                 self.dialog = Some(Dialog::Find {
-                    input: String::new(),
+                    input: self.last_needle.clone(),
                     from_row: self.editor.cursor_row,
                 });
+            }
+
+            // ---- Find Again ----
+            KeyCode::Char('l') if ctrl => {
+                self.find_again();
+            }
+
+            // ---- Replace ----
+            KeyCode::Char('h') if ctrl => {
+                self.dialog = Some(Dialog::Replace {
+                    find: self.last_needle.clone(),
+                    replace_with: String::new(),
+                    from_row: self.editor.cursor_row,
+                    focus_replace: false,
+                });
+            }
+
+            // ---- Go to Line ----
+            KeyCode::Char('g') if ctrl => {
+                self.dialog = Some(Dialog::GoToLine { input: String::new() });
             }
 
             // ---- LSP: completion ----
@@ -318,10 +432,30 @@ impl App {
                 self.show_hover().await;
             }
 
-            // ---- Undo ----
+            // ---- Undo / Redo ----
             KeyCode::Char('z') if ctrl => {
                 self.editor.undo();
                 self.notify_lsp_change().await;
+            }
+            KeyCode::Char('y') if ctrl => {
+                self.editor.redo();
+                self.notify_lsp_change().await;
+            }
+
+            // ---- Cut / Copy / Paste ----
+            KeyCode::Char('x') if ctrl => {
+                self.clipboard = self.editor.cut_line();
+                self.notify_lsp_change().await;
+            }
+            KeyCode::Insert if ctrl => {
+                self.clipboard = self.editor.copy_line();
+            }
+            KeyCode::Insert if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if !self.clipboard.is_empty() {
+                    let text = self.clipboard.clone();
+                    self.editor.insert_str(&text);
+                    self.notify_lsp_change().await;
+                }
             }
 
             // ---- Cursor movement ----
@@ -374,56 +508,99 @@ impl App {
     // ------------------------------------------------------------------
 
     async fn handle_menu_key(&mut self, key: KeyEvent) -> Result<bool> {
-        const MENU_COUNT: usize = 7;
-        match key.code {
-            KeyCode::Esc | KeyCode::F(10) => {
-                self.focus = FocusArea::Editor;
+        if self.submenu_open {
+            // Navigate within the open dropdown.
+            match key.code {
+                KeyCode::Esc => {
+                    self.submenu_open = false;
+                }
+                KeyCode::Up => {
+                    let items = SUBMENUS[self.menu_index];
+                    self.submenu_index = prev_selectable(items, self.submenu_index);
+                }
+                KeyCode::Down => {
+                    let items = SUBMENUS[self.menu_index];
+                    self.submenu_index = next_selectable(items, self.submenu_index);
+                }
+                KeyCode::Left => {
+                    // Move to the previous top-level menu and open its submenu.
+                    self.menu_index = if self.menu_index == 0 {
+                        SUBMENUS.len() - 1
+                    } else {
+                        self.menu_index - 1
+                    };
+                    self.open_submenu();
+                }
+                KeyCode::Right => {
+                    // Move to the next top-level menu and open its submenu.
+                    self.menu_index = (self.menu_index + 1) % SUBMENUS.len();
+                    self.open_submenu();
+                }
+                KeyCode::Enter => {
+                    let menu_idx = self.menu_index;
+                    let item_idx = self.submenu_index;
+                    self.submenu_open = false;
+                    let quit = self.activate_submenu_item(menu_idx, item_idx).await?;
+                    // Return focus to editor unless the action changed it.
+                    if self.focus == FocusArea::Menu {
+                        self.focus = FocusArea::Editor;
+                    }
+                    return Ok(quit);
+                }
+                _ => {}
             }
-            KeyCode::Left => {
-                self.menu_index = self.menu_index.saturating_sub(1);
+        } else {
+            // Navigate the menu bar (no dropdown open).
+            match key.code {
+                KeyCode::Esc | KeyCode::F(10) => {
+                    self.focus = FocusArea::Editor;
+                }
+                KeyCode::Left => {
+                    self.menu_index = if self.menu_index == 0 {
+                        SUBMENUS.len() - 1
+                    } else {
+                        self.menu_index - 1
+                    };
+                }
+                KeyCode::Right => {
+                    self.menu_index = (self.menu_index + 1) % SUBMENUS.len();
+                }
+                KeyCode::Down | KeyCode::Enter => {
+                    self.open_submenu();
+                }
+                // Hotkey letters on the bar open the matching submenu.
+                KeyCode::Char(c) => {
+                    if let Some(idx) = menu_hotkey_index(c) {
+                        self.menu_index = idx;
+                        self.open_submenu();
+                    }
+                }
+                _ => {}
             }
-            KeyCode::Right => {
-                self.menu_index = (self.menu_index + 1).min(MENU_COUNT - 1);
-            }
-            KeyCode::Enter => {
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            // Hotkeys
-            KeyCode::Char('f') | KeyCode::Char('F') => {
-                self.menu_index = 0;
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            KeyCode::Char('e') | KeyCode::Char('E') => {
-                self.menu_index = 1;
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.menu_index = 2;
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.menu_index = 3;
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            KeyCode::Char('h') | KeyCode::Char('H') => {
-                self.menu_index = 6;
-                self.activate_menu_item().await?;
-                self.focus = FocusArea::Editor;
-            }
-            _ => {}
         }
         Ok(false)
     }
 
-    async fn activate_menu_item(&mut self) -> Result<()> {
-        match self.menu_index {
-            0 => {
-                // File → Open
+    /// Open the dropdown for the currently active top-level menu.
+    fn open_submenu(&mut self) {
+        let items = SUBMENUS[self.menu_index];
+        self.submenu_index = first_selectable(items);
+        self.submenu_open = true;
+    }
+
+    /// Activate a submenu item by `(menu_index, item_index)`.
+    /// Returns `true` if the application should quit.
+    async fn activate_submenu_item(&mut self, menu_idx: usize, item_idx: usize) -> Result<bool> {
+        let items = SUBMENUS.get(menu_idx).copied().unwrap_or(&[]);
+        let label = match items.get(item_idx) {
+            Some(i) if !i.is_separator() => i.label,
+            _ => return Ok(false),
+        };
+
+        match (menu_idx, label) {
+            // ── File ────────────────────────────────────────────────────
+            (0, "New") => self.new_file(),
+            (0, "Open...") => {
                 let cur = self
                     .editor
                     .file_path
@@ -432,46 +609,131 @@ impl App {
                     .unwrap_or_default();
                 self.dialog = Some(Dialog::OpenFile { input: cur });
             }
-            1 => {} // Edit — no-op for now
-            2 => {
-                // Search → Find
+            (0, "Save") => self.save_file(),
+            (0, "Save As...") => {
+                let cur = self
+                    .editor
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::SaveAs { input: cur });
+            }
+            (0, "Exit") => return Ok(true),
+
+            // ── Edit ────────────────────────────────────────────────────
+            (1, "Undo") => {
+                self.editor.undo();
+                self.notify_lsp_change().await;
+            }
+            (1, "Redo") => {
+                self.editor.redo();
+                self.notify_lsp_change().await;
+            }
+            (1, "Cut") => {
+                self.clipboard = self.editor.cut_line();
+                self.notify_lsp_change().await;
+            }
+            (1, "Copy") => {
+                self.clipboard = self.editor.copy_line();
+                self.status_msg = Some("Line copied.".into());
+            }
+            (1, "Paste") => {
+                if !self.clipboard.is_empty() {
+                    let text = self.clipboard.clone();
+                    self.editor.insert_str(&text);
+                    self.notify_lsp_change().await;
+                }
+            }
+            (1, "Select All") => {
+                let last = self.editor.line_count().saturating_sub(1);
+                self.editor.goto_line(last);
+                self.editor.move_end();
+                self.status_msg = Some("Cursor moved to end of file.".into());
+            }
+
+            // ── Search ──────────────────────────────────────────────────
+            (2, "Find...") => {
                 self.dialog = Some(Dialog::Find {
-                    input: String::new(),
+                    input: self.last_needle.clone(),
                     from_row: self.editor.cursor_row,
                 });
             }
-            3 => {
-                // Run
-                self.run_project().await;
+            (2, "Replace...") => {
+                self.dialog = Some(Dialog::Replace {
+                    find: self.last_needle.clone(),
+                    replace_with: String::new(),
+                    from_row: self.editor.cursor_row,
+                    focus_replace: false,
+                });
             }
-            6 => {
+            (2, "Find Again") => self.find_again(),
+            (2, "Go to Line...") => {
+                self.dialog = Some(Dialog::GoToLine { input: String::new() });
+            }
+
+            // ── Run ─────────────────────────────────────────────────────
+            (3, "Run") | (3, "Compile") => self.run_project().await,
+            (3, "Parameters...") => {
+                self.dialog = Some(Dialog::Message {
+                    text: "No run parameters configured.".into(),
+                });
+            }
+
+            // ── Options ─────────────────────────────────────────────────
+            (4, "Compiler...") => {
+                self.dialog = Some(Dialog::Message {
+                    text: "Compiler: Kotlin/JVM (kotlinc)\nVersion: 1.9.x".into(),
+                });
+            }
+            (4, "Environment...") => {
+                self.dialog = Some(Dialog::Message {
+                    text: "Editor: BlueIDE\nTheme: Turbo Pascal Classic\nLSP: Kotlin Language Server".into(),
+                });
+            }
+            (4, "Save Settings") => {
+                self.status_msg = Some("Settings saved.".into());
+            }
+
+            // ── Window ───────────────────────────────────────────────────
+            (5, "Toggle File Browser") => {
+                self.show_tree = !self.show_tree;
+                if self.show_tree {
+                    self.focus = FocusArea::Tree;
+                }
+            }
+            (5, "Refresh Display") => {
+                self.status_msg = Some("Display refreshed.".into());
+            }
+            (5, "Close") => {
+                // Close current buffer (new empty file).
+                self.new_file();
+            }
+
+            // ── Help ─────────────────────────────────────────────────────
+            (6, "Contents") | (6, "Index") | (6, "Topic Search") => {
                 self.dialog = Some(Dialog::Help);
             }
+            (6, "About...") => {
+                self.dialog = Some(Dialog::About);
+            }
+
             _ => {}
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// Activate a menu item by its Alt+letter hotkey.
+    /// Activate a menu dropdown by its Alt+letter hotkey.
     ///
-    /// Maps the hotkey character (case-insensitive) to a menu index, fires the
-    /// corresponding action, and returns focus to the editor.  Returns `true`
-    /// when a matching item was found, `false` otherwise (so the key falls
-    /// through to normal handling).
+    /// Opens the matching submenu so the user can pick a sub-item.
+    /// Returns `true` when a matching item was found.
     async fn activate_menu_by_hotkey(&mut self, ch: char) -> bool {
-        let idx = match ch.to_ascii_lowercase() {
-            'f' => 0, // File
-            'e' => 1, // Edit
-            's' => 2, // Search
-            'r' => 3, // Run
-            'o' => 4, // Options
-            'w' => 5, // Window
-            'h' => 6, // Help
-            _ => return false,
+        let Some(idx) = menu_hotkey_index(ch) else {
+            return false;
         };
         self.menu_index = idx;
-        let _ = self.activate_menu_item().await;
-        self.focus = FocusArea::Editor;
+        self.focus = FocusArea::Menu;
+        self.open_submenu();
         true
     }
 
@@ -512,9 +774,8 @@ impl App {
     async fn handle_dialog_key(&mut self, key: KeyEvent) -> Result<bool> {
         let dialog = self.dialog.take();
         match dialog {
-            Some(Dialog::Help) => {
-                // Any key closes help.
-                // dialog already taken (None)
+            Some(Dialog::Help) | Some(Dialog::About) => {
+                // Any key closes.
             }
             Some(Dialog::OpenFile { mut input }) => {
                 match key.code {
@@ -584,6 +845,63 @@ impl App {
                     }
                 }
             }
+            Some(Dialog::Replace { mut find, mut replace_with, from_row, mut focus_replace }) => {
+                match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Tab => {
+                        focus_replace = !focus_replace;
+                        self.dialog = Some(Dialog::Replace { find, replace_with, from_row, focus_replace });
+                    }
+                    KeyCode::Enter => {
+                        if !focus_replace {
+                            // Move focus to the replace field.
+                            self.dialog = Some(Dialog::Replace { find, replace_with, from_row, focus_replace: true });
+                        } else {
+                            // Execute the replacement.
+                            self.replace_one(&find, &replace_with, from_row);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if focus_replace { replace_with.pop(); } else { find.pop(); }
+                        self.dialog = Some(Dialog::Replace { find, replace_with, from_row, focus_replace });
+                    }
+                    KeyCode::Char(c) => {
+                        if focus_replace { replace_with.push(c); } else { find.push(c); }
+                        self.dialog = Some(Dialog::Replace { find, replace_with, from_row, focus_replace });
+                    }
+                    _ => {
+                        self.dialog = Some(Dialog::Replace { find, replace_with, from_row, focus_replace });
+                    }
+                }
+            }
+            Some(Dialog::GoToLine { mut input }) => {
+                match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => {
+                        match input.trim().parse::<usize>() {
+                            Ok(n) if n >= 1 => {
+                                self.editor.goto_line(n - 1); // input is 1-based
+                            }
+                            _ => {
+                                self.dialog = Some(Dialog::Message {
+                                    text: "Invalid line number.".into(),
+                                });
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        self.dialog = Some(Dialog::GoToLine { input });
+                    }
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                        self.dialog = Some(Dialog::GoToLine { input });
+                    }
+                    _ => {
+                        self.dialog = Some(Dialog::GoToLine { input });
+                    }
+                }
+            }
             Some(Dialog::Message { .. }) | Some(Dialog::Hover { .. }) => {
                 // Any key closes.
             }
@@ -649,6 +967,11 @@ impl App {
         }
     }
 
+    fn new_file(&mut self) {
+        self.editor = Editor::default();
+        self.status_msg = Some("New file.".into());
+    }
+
     fn open_file_path(&mut self, path: PathBuf) {
         match Editor::load_file(path) {
             Ok(ed) => {
@@ -667,6 +990,7 @@ impl App {
         if needle.is_empty() {
             return;
         }
+        self.last_needle = needle.to_string();
         let lines = self.editor.lines().to_vec();
         let n = lines.len();
         for offset in 0..n {
@@ -680,6 +1004,31 @@ impl App {
         self.dialog = Some(Dialog::Message {
             text: format!("'{needle}' not found"),
         });
+    }
+
+    /// Search for the last used needle starting from the line after the cursor.
+    fn find_again(&mut self) {
+        if self.last_needle.is_empty() {
+            self.dialog = Some(Dialog::Find {
+                input: String::new(),
+                from_row: self.editor.cursor_row,
+            });
+            return;
+        }
+        let needle = self.last_needle.clone();
+        // Start from the next line to avoid immediately re-matching same position.
+        let from = (self.editor.cursor_row + 1) % self.editor.line_count().max(1);
+        self.find_text(&needle, from);
+    }
+
+    /// Replace the next occurrence of `needle` with `replacement`.
+    fn replace_one(&mut self, needle: &str, replacement: &str, from_row: usize) {
+        self.last_needle = needle.to_string();
+        if !self.editor.replace_next(needle, replacement, from_row) {
+            self.dialog = Some(Dialog::Message {
+                text: format!("'{needle}' not found"),
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -858,11 +1207,63 @@ fn collect_tree(root: &Path, dir: &Path, depth: usize, out: &mut Vec<TreeEntry>)
         let indent = "  ".repeat(depth);
         let prefix = if path.is_dir() { "▸ " } else { "  " };
         let display = format!("{indent}{prefix}{name_str}");
-        let _rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         out.push(TreeEntry { path: path.clone(), display });
 
         if path.is_dir() {
             collect_tree(root, &path, depth + 1, out);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Submenu navigation helpers
+// ---------------------------------------------------------------------------
+
+/// Return the menu index for a hotkey character, or `None`.
+fn menu_hotkey_index(ch: char) -> Option<usize> {
+    match ch.to_ascii_lowercase() {
+        'f' => Some(0), // File
+        'e' => Some(1), // Edit
+        's' => Some(2), // Search
+        'r' => Some(3), // Run
+        'o' => Some(4), // Options
+        'w' => Some(5), // Window
+        'h' => Some(6), // Help
+        _ => None,
+    }
+}
+
+/// Return the index of the first non-separator item in `items`.
+fn first_selectable(items: &[SubMenuItem]) -> usize {
+    items.iter().position(|i| !i.is_separator()).unwrap_or(0)
+}
+
+/// Move selection down, skipping separators.
+fn next_selectable(items: &[SubMenuItem], current: usize) -> usize {
+    let mut next = current + 1;
+    while next < items.len() {
+        if !items[next].is_separator() {
+            return next;
+        }
+        next += 1;
+    }
+    current
+}
+
+/// Move selection up, skipping separators.
+fn prev_selectable(items: &[SubMenuItem], current: usize) -> usize {
+    if current == 0 {
+        return current;
+    }
+    let mut prev = current - 1;
+    loop {
+        if !items[prev].is_separator() {
+            return prev;
+        }
+        if prev == 0 {
+            break;
+        }
+        prev -= 1;
+    }
+    current
 }

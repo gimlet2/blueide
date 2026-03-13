@@ -24,6 +24,8 @@ pub struct Editor {
     pub modified: bool,
     /// Simple undo history: snapshots of (lines, cursor_row, cursor_col).
     undo_stack: Vec<(Vec<String>, usize, usize)>,
+    /// Redo history (rebuilt on undo, cleared on new edits).
+    redo_stack: Vec<(Vec<String>, usize, usize)>,
 }
 
 impl Default for Editor {
@@ -37,6 +39,7 @@ impl Default for Editor {
             file_path: None,
             modified: false,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -314,6 +317,19 @@ impl Editor {
 
     pub fn undo(&mut self) {
         if let Some((lines, row, col)) = self.undo_stack.pop() {
+            // Save current state so the edit can be re-done.
+            self.redo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
+            self.lines = lines;
+            self.cursor_row = row;
+            self.cursor_col = col;
+            self.modified = true;
+        }
+    }
+
+    /// Re-apply the last undone edit.
+    pub fn redo(&mut self) {
+        if let Some((lines, row, col)) = self.redo_stack.pop() {
+            self.undo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
             self.lines = lines;
             self.cursor_row = row;
             self.cursor_col = col;
@@ -322,6 +338,8 @@ impl Editor {
     }
 
     fn push_undo(&mut self) {
+        // Any new edit invalidates the redo history.
+        self.redo_stack.clear();
         if self.undo_stack.len() >= MAX_UNDO {
             self.undo_stack.remove(0);
         }
@@ -347,6 +365,69 @@ impl Editor {
         } else if self.cursor_col >= self.scroll_col + visible_cols {
             self.scroll_col = self.cursor_col + 1 - visible_cols;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Clipboard helpers (line-based, no selection)
+    // ------------------------------------------------------------------
+
+    /// Return the text of the current line (without trailing newline).
+    pub fn copy_line(&self) -> String {
+        self.lines[self.cursor_row].clone()
+    }
+
+    /// Remove the current line and return its text.
+    pub fn cut_line(&mut self) -> String {
+        self.push_undo();
+        let text = self.lines[self.cursor_row].clone();
+        if self.lines.len() > 1 {
+            self.lines.remove(self.cursor_row);
+            if self.cursor_row >= self.lines.len() {
+                self.cursor_row = self.lines.len() - 1;
+            }
+        } else {
+            self.lines[0].clear();
+        }
+        self.cursor_col = 0;
+        self.modified = true;
+        text
+    }
+
+    // ------------------------------------------------------------------
+    // Navigation helpers
+    // ------------------------------------------------------------------
+
+    /// Move the cursor to a specific line (1-based externally, 0-based here).
+    pub fn goto_line(&mut self, row: usize) {
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.clamp_col();
+    }
+
+    // ------------------------------------------------------------------
+    // Search and replace
+    // ------------------------------------------------------------------
+
+    /// Replace the first occurrence of `needle` at or after `from_row`
+    /// with `replacement`.  Returns `true` if a replacement was made.
+    pub fn replace_next(&mut self, needle: &str, replacement: &str, from_row: usize) -> bool {
+        if needle.is_empty() {
+            return false;
+        }
+        let n = self.lines.len();
+        for offset in 0..n {
+            let row = (from_row + offset) % n;
+            if let Some(col_byte) = self.lines[row].find(needle) {
+                self.push_undo();
+                self.lines[row] = self.lines[row].replacen(needle, replacement, 1);
+                // Position cursor at the start of the replacement.
+                let col_char = self.lines[row][..col_byte].chars().count();
+                self.cursor_row = row;
+                self.cursor_col = col_char;
+                self.modified = true;
+                return true;
+            }
+        }
+        false
     }
 
     // ------------------------------------------------------------------

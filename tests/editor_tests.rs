@@ -303,3 +303,108 @@ fn scroll_adjusts_when_cursor_above_viewport() {
     ed.scroll_to_cursor(10, 80);
     assert_eq!(ed.scroll_row, 5);
 }
+
+// ---------------------------------------------------------------------------
+// Redo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redo_reapplies_undone_change() {
+    let mut ed = Editor::with_text("abc");
+    ed.cursor_col = 3;
+    ed.insert_char('!');
+    assert_eq!(ed.lines()[0], "abc!");
+    ed.undo();
+    assert_eq!(ed.lines()[0], "abc");
+    ed.redo();
+    assert_eq!(ed.lines()[0], "abc!");
+}
+
+#[test]
+fn new_edit_clears_redo_stack() {
+    let mut ed = Editor::with_text("abc");
+    ed.cursor_col = 3;
+    ed.insert_char('!');
+    ed.undo();
+    // Make a new edit — redo should now be a no-op.
+    ed.insert_char('?');
+    ed.redo(); // should not restore "abc!"
+    assert_eq!(ed.lines()[0], "abc?");
+}
+
+// ---------------------------------------------------------------------------
+// Copy / Cut line
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_line_returns_current_line_text() {
+    let mut ed = Editor::with_text("hello\nworld");
+    ed.cursor_row = 0;
+    assert_eq!(ed.copy_line(), "hello");
+    ed.cursor_row = 1;
+    assert_eq!(ed.copy_line(), "world");
+}
+
+#[test]
+fn cut_line_removes_line_and_returns_text() {
+    let mut ed = Editor::with_text("alpha\nbeta\ngamma");
+    ed.cursor_row = 1;
+    let text = ed.cut_line();
+    assert_eq!(text, "beta");
+    assert_eq!(ed.line_count(), 2);
+    assert_eq!(ed.lines()[0], "alpha");
+    assert_eq!(ed.lines()[1], "gamma");
+}
+
+#[test]
+fn cut_line_single_line_clears_content() {
+    let mut ed = Editor::with_text("only");
+    let text = ed.cut_line();
+    assert_eq!(text, "only");
+    assert_eq!(ed.line_count(), 1);
+    assert_eq!(ed.lines()[0], "");
+}
+
+// ---------------------------------------------------------------------------
+// Go to Line
+// ---------------------------------------------------------------------------
+
+#[test]
+fn goto_line_moves_cursor_to_row() {
+    let mut ed = Editor::with_text("a\nb\nc\nd\ne");
+    ed.goto_line(3);
+    assert_eq!(ed.cursor_row, 3);
+}
+
+#[test]
+fn goto_line_clamps_to_last_line() {
+    let mut ed = Editor::with_text("a\nb\nc");
+    ed.goto_line(100);
+    assert_eq!(ed.cursor_row, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Replace next
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replace_next_substitutes_first_occurrence() {
+    let mut ed = Editor::with_text("foo bar foo");
+    assert!(ed.replace_next("foo", "baz", 0));
+    assert_eq!(ed.lines()[0], "baz bar foo");
+}
+
+#[test]
+fn replace_next_returns_false_when_not_found() {
+    let mut ed = Editor::with_text("hello world");
+    assert!(!ed.replace_next("xyz", "abc", 0));
+    assert_eq!(ed.lines()[0], "hello world");
+}
+
+#[test]
+fn replace_next_wraps_around_from_row() {
+    let mut ed = Editor::with_text("first\ntarget\nlast");
+    // Start searching from row 2 — should wrap and find "target" on row 1.
+    assert!(ed.replace_next("target", "found", 2));
+    assert_eq!(ed.lines()[1], "found");
+}

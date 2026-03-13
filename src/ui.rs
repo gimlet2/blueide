@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, CompletionState, Dialog, FocusArea, HelpLine};
+use crate::app::{App, CompletionState, Dialog, FocusArea, HelpLine, SubMenuItem, SUBMENUS};
 use crate::editor::{highlight_line, TokenKind};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +98,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_editor(frame, editor_area, app);
     render_status_bar(frame, status_area, app);
 
+    // Submenu dropdown — drawn over the main content, below dialogs.
+    render_submenu_dropdown(frame, menu_area, app);
+
     // Overlays — rendered on top.
     if let Some(ref dialog) = app.dialog.clone() {
         render_dialog(frame, area, dialog, app);
@@ -163,6 +166,99 @@ fn render_menu_bar(frame: &mut Frame, area: Rect, app: &App) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// Submenu dropdown
+// ---------------------------------------------------------------------------
+
+/// X offset (from the left edge of the menu bar) where menu item `idx` starts.
+fn menu_item_x(idx: usize) -> u16 {
+    let mut x = 1u16; // leading space
+    for (i, (hot, rest)) in MENU_ITEMS.iter().enumerate() {
+        if i == idx {
+            return x;
+        }
+        x += (hot.len() + rest.len() + 2) as u16; // label + 2 separator spaces
+    }
+    x
+}
+
+/// Render the dropdown panel for the currently active submenu (if any).
+fn render_submenu_dropdown(frame: &mut Frame, menu_area: Rect, app: &App) {
+    if app.focus != FocusArea::Menu || !app.submenu_open {
+        return;
+    }
+    let items: &[SubMenuItem] = SUBMENUS[app.menu_index];
+    if items.is_empty() {
+        return;
+    }
+
+    // Compute popup dimensions.
+    let max_label = items
+        .iter()
+        .filter(|i| !i.is_separator())
+        .map(|i| i.label.len())
+        .max()
+        .unwrap_or(8);
+    let max_sc = items
+        .iter()
+        .filter(|i| !i.is_separator())
+        .map(|i| i.shortcut.len())
+        .max()
+        .unwrap_or(0);
+    // inner_width = 1 (left pad) + label + gap + shortcut + 1 (right pad)
+    let inner_width = (1 + max_label + 2 + max_sc + 1).max(16) as u16;
+    let popup_width = inner_width + 2; // +2 for the box border
+
+    let x_raw = menu_area.x + menu_item_x(app.menu_index);
+    let frame_width = frame.area().width;
+    let x = x_raw.min(frame_width.saturating_sub(popup_width));
+
+    let y = menu_area.y + menu_area.height;
+    let frame_height = frame.area().height;
+    let popup_height = (items.len() as u16 + 2).min(frame_height.saturating_sub(y));
+
+    let popup = Rect { x, y, width: popup_width, height: popup_height };
+    frame.render_widget(Clear, popup);
+
+    let sep_line = "─".repeat(inner_width as usize);
+
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            if item.is_separator() {
+                return Line::from(Span::styled(
+                    sep_line.clone(),
+                    Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
+                ));
+            }
+            let is_sel = idx == app.submenu_index;
+            let (bg, fg) = if is_sel {
+                (C_CYAN, C_BLACK)
+            } else {
+                (C_GRAY, C_BLACK)
+            };
+            // Layout: " label<gap>shortcut "
+            let gap = (inner_width as usize)
+                .saturating_sub(1 + item.label.len() + item.shortcut.len() + 1);
+            let text = format!(
+                " {}{}{} ",
+                item.label,
+                " ".repeat(gap),
+                item.shortcut,
+            );
+            Line::from(Span::styled(text, Style::default().bg(bg).fg(fg)))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_DARK_GRAY))
+        .style(Style::default().bg(C_GRAY));
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, popup);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,9 +538,14 @@ fn render_completion(
 fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, _app: &App) {
     match dialog {
         Dialog::Help => render_help_dialog(frame, area),
+        Dialog::About => render_about_dialog(frame, area),
         Dialog::OpenFile { input, .. } => render_open_file_dialog(frame, area, input),
         Dialog::SaveAs { input } => render_save_as_dialog(frame, area, input),
         Dialog::Find { input, .. } => render_find_dialog(frame, area, input),
+        Dialog::Replace { find, replace_with, focus_replace, .. } => {
+            render_replace_dialog(frame, area, find, replace_with, *focus_replace);
+        }
+        Dialog::GoToLine { input } => render_goto_line_dialog(frame, area, input),
         Dialog::Message { text, .. } => render_message_dialog(frame, area, text),
         Dialog::Hover { text } => render_hover_dialog(frame, area, text),
     }
@@ -458,20 +559,26 @@ fn dialog_centered(area: Rect, width: u16, height: u16) -> Rect {
 
 fn render_help_dialog(frame: &mut Frame, area: Rect) {
     const HELP: &[HelpLine] = &[
-        HelpLine { key: "F1", action: "Help" },
-        HelpLine { key: "F2", action: "Save" },
-        HelpLine { key: "F3 / Ctrl+O", action: "Open file" },
-        HelpLine { key: "F5", action: "Run / Compile" },
-        HelpLine { key: "F10", action: "Activate menu" },
-        HelpLine { key: "Alt+F/E/S/R/O/W/H", action: "Open menu item directly" },
-        HelpLine { key: "F12", action: "Go to definition" },
-        HelpLine { key: "Ctrl+S", action: "Save" },
-        HelpLine { key: "Ctrl+Q / Alt+F4", action: "Quit" },
-        HelpLine { key: "Ctrl+F", action: "Find" },
-        HelpLine { key: "Ctrl+Space", action: "Code completion" },
-        HelpLine { key: "Ctrl+B", action: "Toggle file browser" },
-        HelpLine { key: "Ctrl+Z", action: "Undo" },
-        HelpLine { key: "ESC", action: "Close dialog / menu" },
+        HelpLine { key: "F1",                  action: "Help" },
+        HelpLine { key: "F2 / Ctrl+S",         action: "Save" },
+        HelpLine { key: "F3 / Ctrl+O",         action: "Open file" },
+        HelpLine { key: "F5",                  action: "Run / Compile" },
+        HelpLine { key: "F9",                  action: "Compile" },
+        HelpLine { key: "F10",                 action: "Activate menu bar" },
+        HelpLine { key: "F12",                 action: "Go to definition" },
+        HelpLine { key: "Alt+F/E/S/R/O/W/H",  action: "Open menu directly" },
+        HelpLine { key: "Ctrl+Q / Alt+F4",     action: "Quit" },
+        HelpLine { key: "Ctrl+Z / Ctrl+Y",     action: "Undo / Redo" },
+        HelpLine { key: "Ctrl+X",              action: "Cut line" },
+        HelpLine { key: "Ctrl+Ins",            action: "Copy line" },
+        HelpLine { key: "Shift+Ins",           action: "Paste" },
+        HelpLine { key: "Ctrl+F",              action: "Find" },
+        HelpLine { key: "Ctrl+L",              action: "Find Again" },
+        HelpLine { key: "Ctrl+H",              action: "Replace" },
+        HelpLine { key: "Ctrl+G",              action: "Go to Line" },
+        HelpLine { key: "Ctrl+Space",          action: "Code completion" },
+        HelpLine { key: "Ctrl+B",              action: "Toggle file browser" },
+        HelpLine { key: "ESC",                 action: "Close dialog / menu" },
     ];
 
     let width = 52u16;
@@ -610,6 +717,101 @@ fn render_hover_dialog(frame: &mut Frame, area: Rect, text: &str) {
     let block = Block::default()
         .title(Span::styled(
             " Hover Info ",
+            Style::default().bg(C_CYAN).fg(C_BLACK),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_GRAY))
+        .style(Style::default().bg(C_GRAY));
+
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, popup);
+}
+
+fn render_replace_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    find: &str,
+    replace_with: &str,
+    focus_replace: bool,
+) {
+    let width = 52u16;
+    let popup = dialog_centered(area, width, 7);
+    frame.render_widget(Clear, popup);
+
+    let find_cursor = if !focus_replace { "_" } else { "" };
+    let repl_cursor = if focus_replace { "_" } else { "" };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Search:  ", Style::default().bg(C_GRAY).fg(C_DARK_GRAY)),
+            Span::styled(
+                format!("{find}{find_cursor}"),
+                Style::default().bg(C_GRAY).fg(C_BLACK),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Replace: ", Style::default().bg(C_GRAY).fg(C_DARK_GRAY)),
+            Span::styled(
+                format!("{replace_with}{repl_cursor}"),
+                Style::default().bg(C_GRAY).fg(C_BLACK),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  [Tab] switch  [Enter] replace  [Esc] cancel",
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
+        )),
+    ];
+
+    let block = Block::default()
+        .title(Span::styled(" Replace ", Style::default().bg(C_CYAN).fg(C_BLACK)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_GRAY))
+        .style(Style::default().bg(C_GRAY));
+
+    let para = Paragraph::new(lines).block(block);
+    frame.render_widget(para, popup);
+}
+
+fn render_goto_line_dialog(frame: &mut Frame, area: Rect, input: &str) {
+    render_input_dialog(frame, area, " Go to Line ", input, "Line: ", 30);
+}
+
+fn render_about_dialog(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  BlueIDE — Turbo Pascal-style Kotlin IDE",
+            Style::default()
+                .bg(C_GRAY)
+                .fg(C_BLACK)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Powered by: Ratatui · Tokio · Crossterm",
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
+        )),
+        Line::from(Span::styled(
+            "  LSP support: Kotlin Language Server",
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
+        )),
+    ];
+
+    let width = 48u16;
+    let height = lines.len() as u16 + 2;
+    let popup = dialog_centered(area, width, height);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " About BlueIDE ",
             Style::default().bg(C_CYAN).fg(C_BLACK),
         ))
         .borders(Borders::ALL)
