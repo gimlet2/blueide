@@ -234,6 +234,15 @@ impl App {
             }
         }
 
+        // Alt+letter directly activates menu items from any focus area.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            if let KeyCode::Char(c) = key.code {
+                if self.activate_menu_by_hotkey(c).await {
+                    return Ok(false);
+                }
+            }
+        }
+
         match self.focus {
             FocusArea::Menu => self.handle_menu_key(key).await,
             FocusArea::Tree => self.handle_tree_key(key),
@@ -441,6 +450,29 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Activate a menu item by its Alt+letter hotkey.
+    ///
+    /// Maps the hotkey character (case-insensitive) to a menu index, fires the
+    /// corresponding action, and returns focus to the editor.  Returns `true`
+    /// when a matching item was found, `false` otherwise (so the key falls
+    /// through to normal handling).
+    async fn activate_menu_by_hotkey(&mut self, ch: char) -> bool {
+        let idx = match ch.to_ascii_lowercase() {
+            'f' => 0, // File
+            'e' => 1, // Edit
+            's' => 2, // Search
+            'r' => 3, // Run
+            'o' => 4, // Options
+            'w' => 5, // Window
+            'h' => 6, // Help
+            _ => return false,
+        };
+        self.menu_index = idx;
+        let _ = self.activate_menu_item().await;
+        self.focus = FocusArea::Editor;
+        true
     }
 
     // ------------------------------------------------------------------

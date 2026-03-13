@@ -463,6 +463,7 @@ fn render_help_dialog(frame: &mut Frame, area: Rect) {
         HelpLine { key: "F3 / Ctrl+O", action: "Open file" },
         HelpLine { key: "F5", action: "Run / Compile" },
         HelpLine { key: "F10", action: "Activate menu" },
+        HelpLine { key: "Alt+F/E/S/R/O/W/H", action: "Open menu item directly" },
         HelpLine { key: "F12", action: "Go to definition" },
         HelpLine { key: "Ctrl+S", action: "Save" },
         HelpLine { key: "Ctrl+Q / Alt+F4", action: "Quit" },
