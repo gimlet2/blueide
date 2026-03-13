@@ -105,7 +105,7 @@ const EDIT_MENU: &[SubMenuItem] = &[
     SubMenuItem { label: "",            shortcut: ""        },
     SubMenuItem { label: "Cut",         shortcut: "Ctrl+X"  },
     SubMenuItem { label: "Copy",        shortcut: "Ctrl+Ins"},
-    SubMenuItem { label: "Paste",       shortcut: "Shft+Ins"},
+    SubMenuItem { label: "Paste",       shortcut: "Shift+Ins"},
     SubMenuItem { label: "",            shortcut: ""        },
     SubMenuItem { label: "Select All",  shortcut: "Ctrl+A"  },
 ];
@@ -141,7 +141,7 @@ const WINDOW_MENU: &[SubMenuItem] = &[
 
 const HELP_MENU: &[SubMenuItem] = &[
     SubMenuItem { label: "Contents",     shortcut: "F1"       },
-    SubMenuItem { label: "Index",        shortcut: "Shft+F1"  },
+    SubMenuItem { label: "Index",        shortcut: "Shift+F1" },
     SubMenuItem { label: "Topic Search", shortcut: ""         },
     SubMenuItem { label: "",            shortcut: ""          },
     SubMenuItem { label: "About...",    shortcut: ""          },
