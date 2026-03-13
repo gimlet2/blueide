@@ -11,21 +11,26 @@ A terminal-based Kotlin IDE inspired by the classic Turbo Pascal blue IDE. Works
 - ⌨️ Keyboard-driven interface
 - 📊 Status bar with diagnostics
 
+![BlueIDE screenshot](https://github.com/user-attachments/assets/5c198e68-5d0f-40fb-8ce7-b3c420ba46ec)
+
 ## Requirements
 
-- Python 3.9+
+- Rust 1.70+ (edition 2021)
 - [kotlin-language-server](https://github.com/fwcd/kotlin-language-server) (optional, for LSP features)
 
 ## Installation
 
 ```bash
-pip install blueide
+cargo install --git https://github.com/gimlet2/blueide
 ```
 
 Or from source:
 
 ```bash
-pip install -e .
+git clone https://github.com/gimlet2/blueide
+cd blueide
+cargo build --release
+./target/release/blueide
 ```
 
 ## Usage
@@ -47,17 +52,17 @@ blueide path/to/project/
 |----------|--------|
 | `F1` | Help |
 | `F2` | Save |
-| `F3` | Open file |
+| `F3` / `Ctrl+O` | Open file |
 | `F5` | Run / compile |
 | `F10` | Activate menu bar |
-| `Alt+F4` | Quit |
+| `Alt+F4` / `Ctrl+Q` | Quit |
 | `Ctrl+S` | Save |
-| `Ctrl+O` | Open file |
-| `Ctrl+Q` | Quit |
 | `Ctrl+F` | Find |
 | `Ctrl+Space` | Trigger completion |
 | `F12` | Go to definition |
+| `F9` | Show hover info |
 | `Ctrl+B` | Toggle file browser |
+| `Ctrl+Z` | Undo |
 
 ## LSP Setup
 
@@ -73,19 +78,22 @@ brew install kotlin-language-server
 
 BlueIDE will automatically detect `kotlin-language-server` in your PATH and use it for:
 - Real-time diagnostics (errors, warnings)
-- Code completion
-- Go-to-definition
-- Hover documentation
+- Code completion (`Ctrl+Space`)
+- Go-to-definition (`F12`)
+- Hover documentation (`F9`)
 
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
 # Run tests
-pytest
+cargo test
 
-# Run with live reload
-textual run --dev src/blueide/app.py
+# Build debug binary
+cargo build
+
+# Build optimised release binary
+cargo build --release
+
+# Run with a specific file
+cargo run -- path/to/file.kt
 ```
