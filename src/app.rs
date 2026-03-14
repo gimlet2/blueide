@@ -11,7 +11,9 @@ use crossterm::event::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use crate::editor::Editor;
-use crate::lsp::{CompletionItem, Diagnostic, LspClient, LspEvent};
+use crate::lsp::{
+    detect_language, resolve_server, CompletionItem, Diagnostic, Language, LspClient, LspEvent,
+};
 
 // ---------------------------------------------------------------------------
 // Focus and mode
@@ -176,6 +178,13 @@ pub struct App {
     pub clipboard: String,
     /// Last search needle (for Find Again).
     pub last_needle: String,
+    /// Detected language for the current editor buffer (None = unknown).
+    pub current_language: Option<&'static Language>,
+    /// Short description of how the LSP was launched ("native" / "docker" / "none").
+    pub lsp_launch_mode: &'static str,
+    /// Set to `true` after a file-open that changed the language; the event
+    /// loop will restart the LSP and clear this flag.
+    pending_lsp_restart: bool,
     lsp: LspClient,
     root_path: PathBuf,
 }
@@ -194,7 +203,16 @@ impl App {
             }
         }
 
-        let lsp = LspClient::new(root_path.clone(), None);
+        // Detect language from the initial file path (if any file was given).
+        let initial_file = open_path.as_ref().filter(|p| p.is_file());
+        let current_language = initial_file.and_then(|p| detect_language(p));
+
+        // Resolve the LSP server command + track how we launched it.
+        let root_str = root_path.to_string_lossy().into_owned();
+        let (server_cmd, lsp_launch_mode) =
+            resolve_server_command(current_language, &root_str);
+
+        let lsp = LspClient::new(root_path.clone(), server_cmd);
         let tree_entries = build_tree(&root_path);
 
         Ok(Self {
@@ -213,6 +231,9 @@ impl App {
             status_msg: None,
             clipboard: String::new(),
             last_needle: String::new(),
+            current_language,
+            lsp_launch_mode,
+            pending_lsp_restart: false,
             lsp,
             root_path,
         })
@@ -243,7 +264,11 @@ impl App {
         if lsp_ok {
             let uri = self.editor.uri();
             let text = self.editor.text();
-            let _ = self.lsp.open_file(&uri, &text, "kotlin").await;
+            let lang_id = self
+                .current_language
+                .map(|l| l.id)
+                .unwrap_or("plaintext");
+            let _ = self.lsp.open_file(&uri, &text, lang_id).await;
         }
 
         let result = self.event_loop(&mut terminal).await;
@@ -269,6 +294,13 @@ impl App {
 
         loop {
             terminal.draw(|f| crate::ui::render(f, self))?;
+
+            // Handle a deferred LSP restart (triggered by opening a file in a
+            // different language).
+            if self.pending_lsp_restart {
+                self.pending_lsp_restart = false;
+                self.restart_lsp().await;
+            }
 
             // Drain any pending LSP events first (non-blocking).
             self.drain_lsp_events();
@@ -682,13 +714,26 @@ impl App {
 
             // ── Options ─────────────────────────────────────────────────
             (4, "Compiler...") => {
-                self.dialog = Some(Dialog::Message {
-                    text: "Compiler: Kotlin/JVM (kotlinc)\nVersion: 1.9.x".into(),
-                });
+                let lang_info = match self.current_language {
+                    Some(l) => format!(
+                        "Language: {name}\nLSP server: {cmd}\nDocker image: {img}\nLaunch mode: {mode}",
+                        name = l.name,
+                        cmd = l.native_cmd,
+                        img = l.docker_image,
+                        mode = self.lsp_launch_mode,
+                    ),
+                    None => "No language detected for the current file.".into(),
+                };
+                self.dialog = Some(Dialog::Message { text: lang_info });
             }
             (4, "Environment...") => {
+                let lsp_status = if self.lsp_available {
+                    format!("LSP: active ({})", self.lsp_launch_mode)
+                } else {
+                    "LSP: inactive".into()
+                };
                 self.dialog = Some(Dialog::Message {
-                    text: "Editor: BlueIDE\nTheme: Turbo Pascal Classic\nLSP: Kotlin Language Server".into(),
+                    text: format!("Editor: BlueIDE\nTheme: Turbo Pascal Classic\n{lsp_status}"),
                 });
             }
             (4, "Save Settings") => {
@@ -973,10 +1018,30 @@ impl App {
     }
 
     fn open_file_path(&mut self, path: PathBuf) {
-        match Editor::load_file(path) {
+        match Editor::load_file(path.clone()) {
             Ok(ed) => {
                 self.editor = ed;
-                self.status_msg = Some("File opened.".into());
+                // Re-detect language — may need a new LSP server.
+                let new_lang = detect_language(&path);
+                let lang_changed = new_lang.map(|l| l.id) != self.current_language.map(|l| l.id);
+                self.current_language = new_lang;
+                if lang_changed {
+                    // Signal that the LSP must be restarted on the next run()
+                    // iteration.  We set a status message and mark the LSP as
+                    // unavailable; the actual restart happens the next time the
+                    // file is opened via `restart_lsp_for_language`.
+                    self.lsp_available = false;
+                    let lang_name = new_lang
+                        .map(|l| l.name)
+                        .unwrap_or("unknown");
+                    self.status_msg = Some(format!(
+                        "Opened · Language: {lang_name} — restarting LSP…"
+                    ));
+                    // Schedule a deferred LSP restart (picked up in event_loop).
+                    self.pending_lsp_restart = true;
+                } else {
+                    self.status_msg = Some("File opened.".into());
+                }
             }
             Err(e) => {
                 self.dialog = Some(Dialog::Message {
@@ -1034,6 +1099,56 @@ impl App {
     // ------------------------------------------------------------------
     // LSP helpers
     // ------------------------------------------------------------------
+
+    /// Stop the current LSP, build a new server command for `current_language`,
+    /// create a fresh [`LspClient`], start it, and notify it about the open file.
+    async fn restart_lsp(&mut self) {
+        // Gracefully stop the old server (if running).
+        self.lsp.stop().await;
+        self.lsp_available = false;
+        self.diagnostics.clear();
+
+        let root_str = self.root_path.to_string_lossy().into_owned();
+        let (server_cmd, launch_mode) =
+            resolve_server_command(self.current_language, &root_str);
+        self.lsp_launch_mode = launch_mode;
+
+        // Create a brand-new client.
+        self.lsp = LspClient::new(self.root_path.clone(), server_cmd);
+
+        let lsp_ok = self.lsp.start().await.unwrap_or(false);
+        self.lsp_available = lsp_ok;
+
+        if lsp_ok {
+            let uri = self.editor.uri();
+            let text = self.editor.text();
+            let lang_id = self
+                .current_language
+                .map(|l| l.id)
+                .unwrap_or("plaintext");
+            let _ = self.lsp.open_file(&uri, &text, lang_id).await;
+
+            let lang_name = self
+                .current_language
+                .map(|l| l.name)
+                .unwrap_or("unknown");
+            self.status_msg = Some(format!(
+                "LSP started ({launch_mode}) for {lang_name}"
+            ));
+        } else {
+            let lang_name = self
+                .current_language
+                .map(|l| l.name)
+                .unwrap_or("unknown");
+            self.status_msg = Some(format!(
+                "No LSP available for {lang_name} — install {cmd} or Docker",
+                cmd = self
+                    .current_language
+                    .map(|l| l.native_cmd)
+                    .unwrap_or("language server"),
+            ));
+        }
+    }
 
     async fn notify_lsp_change(&mut self) {
         if !self.lsp_available {
@@ -1163,6 +1278,30 @@ impl App {
         };
 
         self.dialog = Some(Dialog::Message { text });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LSP server resolution helper
+// ---------------------------------------------------------------------------
+
+/// Build the server argv and a human-readable launch-mode label for a given
+/// optional language.  Returns `(None, "none")` when no server is available.
+fn resolve_server_command(
+    lang: Option<&'static Language>,
+    workspace: &str,
+) -> (Option<Vec<String>>, &'static str) {
+    let Some(lang) = lang else {
+        return (None, "none");
+    };
+    match resolve_server(lang, workspace) {
+        Some(launch @ crate::lsp::ServerLaunch::Native { .. }) => {
+            (Some(launch.into_argv()), "native")
+        }
+        Some(launch @ crate::lsp::ServerLaunch::Docker { .. }) => {
+            (Some(launch.into_argv()), "docker")
+        }
+        None => (None, "none"),
     }
 }
 

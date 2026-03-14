@@ -399,6 +399,15 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let row = app.editor.cursor_row + 1;
     let col = app.editor.cursor_col + 1;
 
+    // Language + LSP launch mode indicator (right of file name).
+    let lang_tag = match app.current_language {
+        Some(l) if app.lsp_launch_mode == "docker" => {
+            format!(" [{}·🐳]", l.name)
+        }
+        Some(l) => format!(" [{}]", l.name),
+        None => String::new(),
+    };
+
     let (errors, warnings) = app
         .diagnostics
         .values()
@@ -417,7 +426,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     } else if warnings > 0 {
         format!(" ⚠ {} warning{}", warnings, if warnings != 1 { "s" } else { "" })
     } else if app.lsp_available {
-        " ✓ LSP".into()
+        format!(" ✓ LSP({})", app.lsp_launch_mode)
     } else {
         " ○ no LSP".into()
     };
@@ -432,11 +441,11 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().bg(C_DARK_GRAY).fg(C_WHITE)
     };
 
-    let left = format!(" Ln {row}, Col {col}  {name}{modified} ");
+    let left = format!(" Ln {row}, Col {col}  {name}{modified}{lang_tag} ");
     let help = " F1=Help F2=Save F3=Open F10=Menu ";
 
-    let left_len = left.len();
-    let diag_len = diag_text.len();
+    let left_len = left.chars().count();
+    let diag_len = diag_text.chars().count();
     let help_len = help.len();
     let total_fixed = left_len + diag_len + help_len;
     let pad = (area.width as usize).saturating_sub(total_fixed);
@@ -535,10 +544,10 @@ fn render_completion(
 // Dialogs
 // ---------------------------------------------------------------------------
 
-fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, _app: &App) {
+fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, app: &App) {
     match dialog {
         Dialog::Help => render_help_dialog(frame, area),
-        Dialog::About => render_about_dialog(frame, area),
+        Dialog::About => render_about_dialog(frame, area, app),
         Dialog::OpenFile { input, .. } => render_open_file_dialog(frame, area, input),
         Dialog::SaveAs { input } => render_save_as_dialog(frame, area, input),
         Dialog::Find { input, .. } => render_find_dialog(frame, area, input),
@@ -778,11 +787,22 @@ fn render_goto_line_dialog(frame: &mut Frame, area: Rect, input: &str) {
     render_input_dialog(frame, area, " Go to Line ", input, "Line: ", 30);
 }
 
-fn render_about_dialog(frame: &mut Frame, area: Rect) {
+fn render_about_dialog(frame: &mut Frame, area: Rect, app: &App) {
+    let lang_line = match app.current_language {
+        Some(l) if app.lsp_launch_mode == "docker" => {
+            format!("  Language: {} · LSP via Docker ({})", l.name, l.docker_image)
+        }
+        Some(l) if app.lsp_launch_mode == "native" => {
+            format!("  Language: {} · LSP native ({})", l.name, l.native_cmd)
+        }
+        Some(l) => format!("  Language: {} · no LSP", l.name),
+        None => "  Language: unknown · no LSP".into(),
+    };
+
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  BlueIDE — Turbo Pascal-style Kotlin IDE",
+            "  BlueIDE — Multi-language Terminal IDE",
             Style::default()
                 .bg(C_GRAY)
                 .fg(C_BLACK)
@@ -794,7 +814,7 @@ fn render_about_dialog(frame: &mut Frame, area: Rect) {
             Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
         )),
         Line::from(Span::styled(
-            "  LSP support: Kotlin Language Server",
+            lang_line,
             Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
         )),
         Line::from(""),
@@ -804,7 +824,7 @@ fn render_about_dialog(frame: &mut Frame, area: Rect) {
         )),
     ];
 
-    let width = 48u16;
+    let width = 58u16;
     let height = lines.len() as u16 + 2;
     let popup = dialog_centered(area, width, height);
     frame.render_widget(Clear, popup);

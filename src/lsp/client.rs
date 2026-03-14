@@ -1,4 +1,4 @@
-//! Async LSP client that manages a kotlin-language-server subprocess
+//! Async LSP client that manages an arbitrary language server subprocess
 //! and communicates with it over stdin/stdout using JSON-RPC.
 
 use std::collections::HashMap;
@@ -18,27 +18,6 @@ use super::protocol::{
     initialize_request, initialized_notification, parse_content_length, shutdown_request,
     CompletionItem, Diagnostic, Location,
 };
-
-/// Name of the Kotlin language server executable.
-const KLS_EXECUTABLE: &str = "kotlin-language-server";
-
-/// Locate `kotlin-language-server` in PATH.
-pub fn find_language_server() -> Option<PathBuf> {
-    which(KLS_EXECUTABLE)
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Events emitted by the LSP client to the application
@@ -70,13 +49,16 @@ enum OutgoingMsg {
 
 /// Async LSP client.
 ///
+/// Call [`LspClient::new`] with an explicit server command (built by
+/// [`super::language::resolve_server`]) or `None` to run with no LSP.
 /// Call [`LspClient::start`] to launch the language server and perform the
 /// LSP handshake.  Once started, use the `complete`, `definition`, `hover`,
 /// `open_file`, `change_file`, `close_file` methods.
 /// Call [`LspClient::stop`] for a graceful shutdown.
 pub struct LspClient {
     root_path: PathBuf,
-    /// Overrides the default `kotlin-language-server` command when set.
+    /// Full argv for the server process (argv[0] = executable).
+    /// `None` → LSP is disabled (no binary found, Docker unavailable, etc.).
     server_cmd: Option<Vec<String>>,
 
     // Runtime state — set after `start()`.
@@ -96,8 +78,14 @@ pub struct LspClient {
 impl LspClient {
     /// Create a new client rooted at `root_path`.
     ///
-    /// `server_cmd` overrides the default `kotlin-language-server` executable
-    /// (useful for testing with a mock server).
+    /// `server_cmd` is the full argv for the language-server process:
+    /// - `Some(argv)` — launch that command.
+    /// - `None` — start without any server (LSP features will be silently
+    ///   unavailable).
+    ///
+    /// The command is typically built by
+    /// [`super::language::resolve_server`] and converted with
+    /// [`super::language::ServerLaunch::into_argv`].
     pub fn new(root_path: PathBuf, server_cmd: Option<Vec<String>>) -> Self {
         Self {
             root_path,
@@ -123,17 +111,15 @@ impl LspClient {
     /// Start the language server and perform the LSP initialize handshake.
     ///
     /// Returns `Ok(true)` if the server was started and initialized
-    /// successfully, `Ok(false)` if no server executable was found.
+    /// successfully, `Ok(false)` if `server_cmd` is `None` (no server
+    /// configured).
     pub async fn start(&mut self) -> Result<bool> {
         let cmd = match &self.server_cmd {
-            Some(v) => v.clone(),
-            None => match find_language_server() {
-                Some(p) => vec![p.to_string_lossy().into_owned()],
-                None => {
-                    log::info!("kotlin-language-server not found; LSP disabled");
-                    return Ok(false);
-                }
-            },
+            Some(v) if !v.is_empty() => v.clone(),
+            _ => {
+                log::info!("no LSP server command configured; LSP disabled");
+                return Ok(false);
+            }
         };
 
         let mut child = Command::new(&cmd[0])
@@ -479,3 +465,4 @@ fn extract_hover_text(result: &Value) -> String {
         _ => String::new(),
     }
 }
+
