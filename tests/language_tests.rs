@@ -142,6 +142,7 @@ fn resolve_returns_none_when_path_is_empty() {
     assert!(result.is_none(), "expected None with empty PATH");
 }
 
+#[cfg(unix)]
 #[test]
 fn resolve_prefers_native_over_docker() {
     // Create a fake executable in a temp dir.

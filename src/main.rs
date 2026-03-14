@@ -1,4 +1,4 @@
-//! BlueIDE — A terminal Kotlin IDE inspired by Turbo Pascal.
+//! BlueIDE — A terminal IDE with multi-language LSP support, inspired by Turbo Pascal.
 
 mod app;
 mod editor;
