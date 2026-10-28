@@ -11,6 +11,7 @@ A terminal-based multi-language IDE inspired by the classic Turbo Pascal blue ID
 - 🐳 Docker fallback — if the native LSP binary is not installed, BlueIDE will try to run it inside Docker
 - ⌨️ Keyboard-driven interface (Turbo Pascal-style dropdown menus)
 - 🛠️ Compile and run recipes with diagnostic navigation
+- 🌿 Git review with subtle changed-line gutter marks, inline diffs, staging, and commit preparation
 - 🐞 GDB TUI debugging for Rust, C, C++, and Free Pascal
 - 📑 Multiple open buffers, collapsible file tree, and block selection
 - 📊 Status bar with diagnostics and language indicator
@@ -95,6 +96,7 @@ blueide path/to/project/
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next buffer |
 | `Ctrl+1`–`Ctrl+9` | Jump to a visible buffer |
 | `F10` | Activate menu bar |
+| `Alt+G` | Open Git menu and review local changes |
 | `F12` | Go to definition (LSP) |
 | `Alt+F4` / `Ctrl+Q` | Quit |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / Redo |
@@ -111,6 +113,8 @@ blueide path/to/project/
 | `Ctrl+B` | Toggle file browser |
 
 Mouse clicks select menu items, buffers, and files; click in the editor to place the cursor, drag to select text, and use the wheel to scroll.
+
+The Git menu reviews changed files and staged/unstaged state, stages files, and prepares commits. Its Branches screen can create or switch local branches and push or pull the current branch. Pull uses `--ff-only` to avoid creating an unexpected merge commit. The Log view shows commit messages and changed files; focus the file list with `Right` or `Tab`, then press `Enter` to expand a file diff.
 
 ## LSP Setup
 
