@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, BuildDiagnostic, CompletionState, Dialog, FocusArea, HelpLine, SettingKind, SubMenuItem, SUBMENUS};
+use crate::app::{App, BuildDiagnostic, CompletionState, Dialog, FocusArea, GitChange, GitCommitEntry, GitLogFile, HelpLine, SettingKind, SubMenuItem, SUBMENUS};
 use crate::editor::{highlight_line_for_language, TokenKind};
 use crate::lsp::{Diagnostic, DiagnosticSeverity};
 
@@ -59,6 +59,8 @@ pub const C_COMMENT: Color = Color::Rgb(85, 170, 170);
 pub const C_NUM: Color = Color::Rgb(255, 255, 85);
 /// Magenta annotations and decorators.
 pub const C_ANNOT: Color = Color::Rgb(255, 85, 255);
+/// Low contrast green used only for Git changed-line gutter marks.
+pub const C_GIT_CHANGE: Color = Color::Rgb(100, 170, 115);
 
 // ---------------------------------------------------------------------------
 // Main render entry-point
@@ -138,6 +140,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
     ("E", "dit"),
     ("S", "earch"),
     ("R", "un"),
+    ("G", "it"),
     ("O", "ptions"),
     ("W", "indow"),
     ("H", "elp"),
@@ -385,6 +388,7 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
             .iter()
             .map(|diagnostic| diagnostic.severity)
             .min_by_key(|severity| diagnostic_priority(*severity));
+        let is_git_changed = app.git_changed_lines.contains(&row_idx);
 
         // Build visible slice of the line with syntax highlighting.
         let mut spans: Vec<Span> = Vec::new();
@@ -395,12 +399,12 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
             .and_then(|p| app.breakpoints.get(p))
             .is_some_and(|rows| rows.contains(&row_idx));
         spans.push(Span::styled(
-            line_severity.map(diagnostic_marker).unwrap_or(if has_breakpoint { '●' } else { ' ' }).to_string(),
-            Style::default().bg(line_bg).fg(line_severity.map(diagnostic_color).unwrap_or(if has_breakpoint { C_RED } else { C_WHITE })),
+            line_severity.map(diagnostic_marker).unwrap_or(if has_breakpoint { '●' } else if is_git_changed { '·' } else { ' ' }).to_string(),
+            Style::default().bg(line_bg).fg(line_severity.map(diagnostic_color).unwrap_or(if has_breakpoint { C_RED } else if is_git_changed { C_GIT_CHANGE } else { C_WHITE })),
         ));
         spans.push(Span::styled(
             format!("{:>4} ", row_idx + 1),
-            Style::default().bg(line_bg).fg(C_CYAN),
+            Style::default().bg(line_bg).fg(if is_git_changed && line_severity.is_none() { C_GIT_CHANGE } else { C_CYAN }),
         ));
 
         for col_idx in scroll_col..scroll_col + display_len {
@@ -737,6 +741,19 @@ fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, app: &App) {
             "Unsaved changes. Press Y to discard, N or Esc to cancel.",
             &["Discard", "Cancel"],
         ),
+        Dialog::GitChanges { changes, selected, scroll } => {
+            render_git_review(frame, area, changes, *selected, *scroll, None);
+        }
+        Dialog::GitCommit { changes, selected, scroll, message } => {
+            render_git_review(frame, area, changes, *selected, *scroll, Some(message));
+        }
+        Dialog::GitBranches { branches, current, selected } => {
+            render_git_branches(frame, area, branches, current, *selected);
+        }
+        Dialog::GitNewBranch { name, .. } => render_git_new_branch(frame, area, name),
+        Dialog::GitLog { entries, selected, message, files, selected_file, file_focus, expanded_file, scroll } => {
+            render_git_log(frame, area, entries, *selected, message, files, *selected_file, *file_focus, *expanded_file, *scroll);
+        }
         Dialog::BuildOutput { title, lines, diagnostics, selected } => {
             render_build_output(frame, area, title, lines, diagnostics, *selected);
         }
@@ -822,7 +839,8 @@ fn render_help_dialog(frame: &mut Frame, area: Rect) {
         HelpLine { key: "F9 / Ctrl+F9",        action: "Compile / Run" },
         HelpLine { key: "F10",                 action: "Activate menu bar" },
         HelpLine { key: "F12",                 action: "Go to definition" },
-        HelpLine { key: "Alt+F/E/S/R/O/W/H",  action: "Open menu directly" },
+        HelpLine { key: "Alt+F/E/S/R/G/O/W/H", action: "Open menu directly" },
+        HelpLine { key: "Git menu",             action: "Review, stage, commit, manage branches, read log" },
         HelpLine { key: "Ctrl+Q / Alt+F4",     action: "Quit" },
         HelpLine { key: "Ctrl+Z / Ctrl+Y",     action: "Undo / Redo" },
         HelpLine { key: "Ctrl+X / Ins / Shift+Ins", action: "Cut / Copy / Paste" },
@@ -1037,6 +1055,438 @@ pub(crate) fn dialog_button_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> O
         button_x = end_x.saturating_add(2);
     }
     None
+}
+
+fn render_git_review(
+    frame: &mut Frame,
+    area: Rect,
+    changes: &[GitChange],
+    selected: usize,
+    scroll: usize,
+    commit_message: Option<&str>,
+) {
+    let width = area.width.saturating_sub(2).min(110).max(40);
+    let height = area.height.saturating_sub(2).min(32).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    frame.render_widget(Clear, popup);
+
+    let title = if commit_message.is_some() { " Prepare Commit " } else { " Git · Local Changes " };
+    let block = Block::default()
+        .title(Span::styled(title, Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(C_BLUE).fg(C_WHITE));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let footer_height = if commit_message.is_some() { 2 } else { 1 };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0]);
+
+    let list_height = cols[0].height.saturating_sub(2) as usize;
+    let list_start = selected.saturating_sub(list_height.saturating_sub(1));
+    let file_items: Vec<ListItem> = changes
+        .iter()
+        .enumerate()
+        .skip(list_start)
+        .take(list_height)
+        .map(|(idx, change)| {
+            let selected_style = idx == selected;
+            let marker = git_status_marker(change);
+            let label = format!("{marker} {}", change.path.display());
+            let file_color = if marker.contains('A') || marker == "??" {
+                C_GIT_CHANGE
+            } else if marker.contains('D') {
+                C_ORANGE
+            } else {
+                C_WHITE
+            };
+            let style = if selected_style {
+                Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(C_BLUE).fg(file_color)
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
+    let files_block = Block::default()
+        .title(Span::styled(format!(" Changes ({}) ", changes.len()), Style::default().fg(C_YELLOW)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_DARK_GRAY));
+    frame.render_widget(List::new(file_items).block(files_block), cols[0]);
+
+    let diff_lines: Vec<Line> = changes
+        .get(selected)
+        .map(|change| {
+            change.diff.iter().map(|line| {
+                let style = if line.starts_with('+') && !line.starts_with("+++") {
+                    Style::default().fg(C_GIT_CHANGE)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Style::default().fg(C_RED)
+                } else if line.starts_with("@@") {
+                    Style::default().fg(C_CYAN)
+                } else {
+                    Style::default().fg(C_WHITE)
+                };
+                Line::from(Span::styled(line.as_str(), style))
+            }).collect()
+        })
+        .unwrap_or_else(|| vec![Line::from("Select a changed file to review its diff.")]);
+    let diff_block = Block::default()
+        .title(Span::styled(" Diff ", Style::default().fg(C_YELLOW)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_DARK_GRAY));
+    let diff_area = diff_block.inner(cols[1]);
+    frame.render_widget(diff_block, cols[1]);
+    frame.render_widget(
+        Paragraph::new(diff_lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false }),
+        diff_area,
+    );
+
+    if let Some(message) = commit_message {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Commit message: ", Style::default().fg(C_YELLOW)),
+                Span::styled(format!("{message}_"), Style::default().fg(C_WHITE)),
+            ])),
+            rows[1],
+        );
+        // The bottom row stays a compact action hint.
+        frame.render_widget(
+            Paragraph::new("Enter: commit staged changes    Esc: back to review")
+                .style(Style::default().bg(C_CYAN).fg(C_BLACK)),
+            Rect { y: rows[1].y.saturating_add(1), height: 1, ..rows[1] },
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("↑/↓ file  PgUp/Dn diff  Space stage/unstage  A stage all  C commit  Enter open  R refresh  Esc close")
+                .style(Style::default().bg(C_CYAN).fg(C_BLACK)),
+            rows[1],
+        );
+    }
+}
+
+fn git_status_marker(change: &GitChange) -> String {
+    if change.index_status == '?' && change.worktree_status == '?' {
+        return "??".into();
+    }
+    let index = if change.index_status == '?' { ' ' } else { change.index_status };
+    let worktree = if change.worktree_status == '?' { ' ' } else { change.worktree_status };
+    format!("{index}{worktree}")
+}
+
+fn render_git_branches(frame: &mut Frame, area: Rect, branches: &[String], current: &str, selected: usize) {
+    let width = area.width.saturating_sub(6).min(72).max(34);
+    let height = area.height.saturating_sub(4).min(24).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Git · Branches ", Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(C_BLUE).fg(C_WHITE));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(C_YELLOW)),
+            Span::styled(if current.is_empty() { "(no branch yet)" } else { current }, Style::default().fg(C_WHITE)),
+        ])),
+        rows[0],
+    );
+    let visible = rows[1].height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let items: Vec<ListItem> = branches.iter().enumerate().skip(start).take(visible).map(|(idx, branch)| {
+        let active = branch == current;
+        let label = format!("{} {}", if active { "*" } else { " " }, branch);
+        let style = if idx == selected {
+            Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)
+        } else if active {
+            Style::default().fg(C_GIT_CHANGE)
+        } else {
+            Style::default().fg(C_WHITE)
+        };
+        ListItem::new(label).style(style)
+    }).collect();
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(C_DARK_GRAY))),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("↑/↓ select  Enter switch  N new  P push  L pull  R refresh  Esc close")
+            .style(Style::default().bg(C_CYAN).fg(C_BLACK)),
+        rows[2],
+    );
+}
+
+fn render_git_new_branch(frame: &mut Frame, area: Rect, name: &str) {
+    let width = 60.min(area.width);
+    let height = 7.min(area.height);
+    let popup = dialog_centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Create Branch ", Style::default().bg(C_CYAN).fg(C_BLACK)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(C_GRAY).fg(C_BLACK));
+    let lines = vec![
+        Line::from("Branch name (will switch to it):"),
+        Line::from(Span::styled(format!("{name}_"), Style::default().bg(C_GRAY).fg(C_BLACK).add_modifier(Modifier::UNDERLINED))),
+        Line::from("Enter: create    Esc: back"),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+fn render_git_log(
+    frame: &mut Frame,
+    area: Rect,
+    entries: &[GitCommitEntry],
+    selected: usize,
+    message: &str,
+    files: &[GitLogFile],
+    selected_file: usize,
+    file_focus: bool,
+    expanded_file: Option<usize>,
+    scroll: usize,
+) {
+    let width = area.width.saturating_sub(2).min(110).max(40);
+    let height = area.height.saturating_sub(2).min(32).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Git · Log ", Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(C_BLUE).fg(C_WHITE));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(rows[0]);
+
+    let list_height = cols[0].height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(list_height.saturating_sub(1));
+    let items: Vec<ListItem> = entries.iter().enumerate().skip(start).take(list_height).map(|(idx, entry)| {
+        let style = if idx == selected {
+            Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_WHITE)
+        };
+        ListItem::new(format!("{} {} {}", entry.short_hash, entry.date, entry.subject)).style(style)
+    }).collect();
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(Span::styled(format!(" Commits ({}) ", entries.len()), Style::default().fg(C_YELLOW)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(C_DARK_GRAY)),
+        ),
+        cols[0],
+    );
+
+    if let Some(file_index) = expanded_file.filter(|index| *index < files.len()) {
+        let file = &files[file_index];
+        let diff: Vec<Line> = file.diff.as_deref().unwrap_or(&[]).iter().map(|line| {
+            let color = if line.starts_with('+') && !line.starts_with("+++") {
+                C_GIT_CHANGE
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                C_RED
+            } else if line.starts_with("@@") {
+                C_CYAN
+            } else {
+                C_WHITE
+            };
+            Line::from(Span::styled(line.as_str(), Style::default().fg(color)))
+        }).collect();
+        let diff_block = Block::default()
+            .title(Span::styled(format!(" {} {} ", file.status, file.path), Style::default().fg(C_YELLOW)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(C_DARK_GRAY));
+        let diff_area = diff_block.inner(cols[1]);
+        frame.render_widget(diff_block, cols[1]);
+        frame.render_widget(
+            Paragraph::new(diff).scroll((scroll.min(u16::MAX as usize) as u16, 0)).wrap(Wrap { trim: false }),
+            diff_area,
+        );
+        frame.render_widget(
+            Paragraph::new("Enter: close file diff  PgUp/Dn: scroll diff  Esc: close log")
+                .style(Style::default().bg(C_CYAN).fg(C_BLACK)),
+            rows[1],
+        );
+        return;
+    }
+
+    let details_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(cols[1]);
+    let message_block = Block::default()
+        .title(Span::styled(" Commit Message ", Style::default().fg(C_YELLOW)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_DARK_GRAY));
+    let message_area = message_block.inner(details_rows[0]);
+    frame.render_widget(message_block, details_rows[0]);
+    let message_lines: Vec<Line> = if message.is_empty() {
+        vec![Line::from("(empty commit message)")]
+    } else {
+        message.lines().map(Line::from).collect()
+    };
+    frame.render_widget(
+        Paragraph::new(message_lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)).wrap(Wrap { trim: false }),
+        message_area,
+    );
+
+    let files_block = Block::default()
+        .title(Span::styled(" Changed Files · Enter opens diff ", Style::default().fg(C_YELLOW)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if file_focus { C_CYAN } else { C_DARK_GRAY }));
+    let files_area = files_block.inner(details_rows[1]);
+    frame.render_widget(files_block, details_rows[1]);
+    let file_height = files_area.height as usize;
+    let file_start = selected_file.saturating_sub(file_height.saturating_sub(1));
+    let file_items: Vec<ListItem> = if files.is_empty() {
+        vec![ListItem::new("(no changed files listed)").style(Style::default().fg(C_DARK_GRAY))]
+    } else {
+        files.iter().enumerate().skip(file_start).take(file_height).map(|(idx, file)| {
+            let color = if file.status.starts_with('A') { C_GIT_CHANGE } else if file.status.starts_with('D') { C_ORANGE } else { C_WHITE };
+            let style = if file_focus && idx == selected_file {
+                Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            ListItem::new(format!("{}  {}", file.status, file.path)).style(style)
+        }).collect()
+    };
+    frame.render_widget(List::new(file_items), files_area);
+    frame.render_widget(
+        Paragraph::new("←/→ or Tab: switch pane  ↑/↓: select  Enter: expand/collapse file diff  R refresh  Esc close")
+            .style(Style::default().bg(C_CYAN).fg(C_BLACK)),
+        rows[1],
+    );
+}
+
+pub(crate) fn git_review_item_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> Option<usize> {
+    let Dialog::GitChanges { changes, selected, .. } = dialog else { return None; };
+    let width = area.width.saturating_sub(2).min(110).max(40);
+    let height = area.height.saturating_sub(2).min(32).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0]);
+    let list_height = cols[0].height.saturating_sub(2) as usize;
+    let list_start = selected.saturating_sub(list_height.saturating_sub(1));
+    let row = y.checked_sub(cols[0].y.saturating_add(1))? as usize;
+    if x < cols[0].x.saturating_add(1)
+        || x >= cols[0].x.saturating_add(cols[0].width.saturating_sub(1))
+        || row >= list_height
+    {
+        return None;
+    }
+    let index = list_start + row;
+    (index < changes.len()).then_some(index)
+}
+
+pub(crate) fn git_branch_item_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> Option<usize> {
+    let Dialog::GitBranches { branches, selected, .. } = dialog else { return None; };
+    let width = area.width.saturating_sub(6).min(72).max(34);
+    let height = area.height.saturating_sub(4).min(24).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let visible = rows[1].height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let row = y.checked_sub(rows[1].y.saturating_add(1))? as usize;
+    if x < rows[1].x.saturating_add(1)
+        || x >= rows[1].x.saturating_add(rows[1].width.saturating_sub(1))
+        || row >= visible
+    {
+        return None;
+    }
+    let index = start + row;
+    (index < branches.len()).then_some(index)
+}
+
+pub(crate) fn git_log_item_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> Option<usize> {
+    let Dialog::GitLog { entries, selected, .. } = dialog else { return None; };
+    let width = area.width.saturating_sub(2).min(110).max(40);
+    let height = area.height.saturating_sub(2).min(32).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(rows[0]);
+    let visible = cols[0].height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    let row = y.checked_sub(cols[0].y.saturating_add(1))? as usize;
+    if x < cols[0].x.saturating_add(1)
+        || x >= cols[0].x.saturating_add(cols[0].width.saturating_sub(1))
+        || row >= visible
+    {
+        return None;
+    }
+    let index = start + row;
+    (index < entries.len()).then_some(index)
+}
+
+pub(crate) fn git_log_file_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> Option<usize> {
+    let Dialog::GitLog { entries, files, selected_file, expanded_file, .. } = dialog else { return None; };
+    if entries.is_empty() || files.is_empty() || expanded_file.is_some() { return None; }
+    let width = area.width.saturating_sub(2).min(110).max(40);
+    let height = area.height.saturating_sub(2).min(32).max(8);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(rows[0]);
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(cols[1]);
+    let files_area = Block::default().borders(Borders::ALL).inner(detail_rows[1]);
+    let visible = files_area.height as usize;
+    let start = selected_file.saturating_sub(visible.saturating_sub(1));
+    let row = y.checked_sub(files_area.y)? as usize;
+    if x < files_area.x || x >= files_area.x.saturating_add(files_area.width) || row >= visible {
+        return None;
+    }
+    let index = start + row;
+    (index < files.len()).then_some(index)
 }
 
 fn render_hover_dialog(frame: &mut Frame, area: Rect, text: &str, scroll: u16) {

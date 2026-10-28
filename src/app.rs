@@ -47,6 +47,20 @@ pub enum Dialog {
     Message { text: String },
     Hover { text: String, scroll: u16 },
     DockerApproval { image: String },
+    GitChanges { changes: Vec<GitChange>, selected: usize, scroll: usize },
+    GitCommit { changes: Vec<GitChange>, selected: usize, scroll: usize, message: String },
+    GitBranches { branches: Vec<String>, current: String, selected: usize },
+    GitNewBranch { branches: Vec<String>, current: String, selected: usize, name: String },
+    GitLog {
+        entries: Vec<GitCommitEntry>,
+        selected: usize,
+        message: String,
+        files: Vec<GitLogFile>,
+        selected_file: usize,
+        file_focus: bool,
+        expanded_file: Option<usize>,
+        scroll: usize,
+    },
     ConfirmDiscard { action: PendingFileAction },
     BuildOutput {
         title: String,
@@ -77,6 +91,38 @@ pub struct BuildDiagnostic {
     pub path: PathBuf,
     pub row: usize,
     pub column: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitChange {
+    pub path: PathBuf,
+    pub index_status: char,
+    pub worktree_status: char,
+    pub diff: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitCommitEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub date: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitLogFile {
+    pub status: String,
+    pub path: String,
+    diff_path: String,
+    pub diff: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+enum GitOperation {
+    CreateBranch(String),
+    SwitchBranch(String),
+    Push,
+    Pull,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +219,15 @@ const RUN_MENU: &[SubMenuItem] = &[
     SubMenuItem { label: "Parameters...", shortcut: ""    },
 ];
 
+const GIT_MENU: &[SubMenuItem] = &[
+    SubMenuItem { label: "Review Changes...", shortcut: "" },
+    SubMenuItem { label: "Branches...",       shortcut: "" },
+    SubMenuItem { label: "Log...",            shortcut: "" },
+    SubMenuItem { label: "",                  shortcut: "" },
+    SubMenuItem { label: "Push",              shortcut: "" },
+    SubMenuItem { label: "Pull",              shortcut: "" },
+];
+
 const OPTIONS_MENU: &[SubMenuItem] = &[
     SubMenuItem { label: "Compiler...",    shortcut: "" },
     SubMenuItem { label: "Environment...", shortcut: "" },
@@ -195,9 +250,9 @@ const HELP_MENU: &[SubMenuItem] = &[
     SubMenuItem { label: "About...",    shortcut: ""          },
 ];
 
-/// Indexed by menu_index (0 = File … 6 = Help).
+/// Indexed by menu_index (0 = File … 7 = Help).
 pub const SUBMENUS: &[&[SubMenuItem]] = &[
-    FILE_MENU, EDIT_MENU, SEARCH_MENU, RUN_MENU, OPTIONS_MENU, WINDOW_MENU, HELP_MENU,
+    FILE_MENU, EDIT_MENU, SEARCH_MENU, RUN_MENU, GIT_MENU, OPTIONS_MENU, WINDOW_MENU, HELP_MENU,
 ];
 
 // ---------------------------------------------------------------------------
@@ -243,7 +298,10 @@ pub struct App {
     pending_run: bool,
     pending_docker: Option<(String, Vec<String>)>,
     pending_docker_approval: bool,
+    pending_git_operation: Option<GitOperation>,
     enhanced_keyboard: bool,
+    pub git_changed_lines: HashSet<usize>,
+    git_last_refresh: tokio::time::Instant,
     lsp: LspClient,
     root_path: PathBuf,
 }
@@ -314,7 +372,10 @@ impl App {
             pending_run: false,
             pending_docker,
             pending_docker_approval: false,
+            pending_git_operation: None,
             enhanced_keyboard: false,
+            git_changed_lines: HashSet::new(),
+            git_last_refresh: tokio::time::Instant::now(),
             lsp,
             root_path,
         })
@@ -442,7 +503,15 @@ impl App {
                 terminal.draw(|f| crate::ui::render(f, self))?;
                 self.approve_docker_lsp().await;
             }
+            if let Some(operation) = self.pending_git_operation.take() {
+                terminal.draw(|f| crate::ui::render(f, self))?;
+                self.run_git_operation(operation).await;
+            }
             self.autosave_idle_buffers();
+            if self.git_last_refresh.elapsed() >= Duration::from_secs(1) {
+                self.refresh_git_line_markers().await;
+                self.git_last_refresh = tokio::time::Instant::now();
+            }
         }
         Ok(())
     }
@@ -917,8 +986,21 @@ impl App {
                 });
             }
 
+            // ── Git ────────────────────────────────────────────────────
+            (4, "Review Changes...") => self.open_git_review().await,
+            (4, "Branches...") => self.open_git_branches().await,
+            (4, "Log...") => self.open_git_log().await,
+            (4, "Push") => {
+                self.pending_git_operation = Some(GitOperation::Push);
+                self.status_msg = Some("Pushing current branch to origin…".into());
+            }
+            (4, "Pull") => {
+                self.pending_git_operation = Some(GitOperation::Pull);
+                self.status_msg = Some("Pulling current branch (fast-forward only)…".into());
+            }
+
             // ── Options ─────────────────────────────────────────────────
-            (4, "Compiler...") => {
+            (5, "Compiler...") => {
                 if let Some(lang) = self.current_language {
                     self.dialog = Some(Dialog::SettingsInput {
                         kind: SettingKind::Compiler(lang.id.into()),
@@ -928,7 +1010,7 @@ impl App {
                     self.dialog = Some(Dialog::Message { text: "Open a source file to configure its compiler command.".into() });
                 }
             }
-            (4, "Environment...") => {
+            (5, "Environment...") => {
                 let lsp_status = if self.lsp_available {
                     format!("LSP: active ({})", self.lsp_launch_mode)
                 } else {
@@ -942,7 +1024,7 @@ impl App {
                     ),
                 });
             }
-            (4, "Save Settings") => {
+            (5, "Save Settings") => {
                 match serde_json::to_string_pretty(&self.settings)
                     .map_err(anyhow::Error::from)
                     .and_then(|json| std::fs::write(self.root_path.join(".blueide.json"), json).map_err(anyhow::Error::from))
@@ -953,25 +1035,25 @@ impl App {
             }
 
             // ── Window ───────────────────────────────────────────────────
-            (5, "Toggle File Browser") => {
+            (6, "Toggle File Browser") => {
                 self.show_tree = !self.show_tree;
                 if self.show_tree {
                     self.focus = FocusArea::Tree;
                 }
             }
-            (5, "Refresh Display") => {
+            (6, "Refresh Display") => {
                 self.status_msg = Some("Display refreshed.".into());
             }
-            (5, "Close") => {
+            (6, "Close") => {
                 // Close current buffer (new empty file).
                 self.new_file();
             }
 
             // ── Help ─────────────────────────────────────────────────────
-            (6, "Contents") | (6, "Index") | (6, "Topic Search") => {
+            (7, "Contents") | (7, "Index") | (7, "Topic Search") => {
                 self.dialog = Some(Dialog::Help);
             }
-            (6, "About...") => {
+            (7, "About...") => {
                 self.dialog = Some(Dialog::About);
             }
 
@@ -1059,6 +1141,67 @@ impl App {
         if let Some(dialog) = self.dialog.clone() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                if let Some(Dialog::GitChanges { changes, selected, .. }) = &mut self.dialog {
+                    if let Some(index) = crate::ui::git_review_item_at(
+                        &dialog,
+                        Rect::new(0, 0, width, height),
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        *selected = index.min(changes.len().saturating_sub(1));
+                        return Ok(false);
+                    }
+                }
+                if let Some(Dialog::GitBranches { branches, selected, .. }) = &mut self.dialog {
+                    if let Some(index) = crate::ui::git_branch_item_at(
+                        &dialog,
+                        Rect::new(0, 0, width, height),
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        *selected = index.min(branches.len().saturating_sub(1));
+                        return Ok(false);
+                    }
+                }
+                if let Some(index) = crate::ui::git_log_file_at(
+                    &dialog,
+                    Rect::new(0, 0, width, height),
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    if let Some(Dialog::GitLog { selected_file, file_focus, .. }) = &mut self.dialog {
+                        *selected_file = index;
+                        *file_focus = true;
+                        return Ok(false);
+                    }
+                }
+                if let Some(index) = crate::ui::git_log_item_at(
+                    &dialog,
+                    Rect::new(0, 0, width, height),
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    let entry = if let Some(Dialog::GitLog { entries, selected, selected_file, file_focus, expanded_file, scroll, .. }) = &mut self.dialog {
+                        *selected = index.min(entries.len().saturating_sub(1));
+                        *selected_file = 0;
+                        *file_focus = false;
+                        *expanded_file = None;
+                        *scroll = 0;
+                        entries.get(*selected).cloned()
+                    } else { None };
+                    if let Some(entry) = entry {
+                        match self.load_git_commit_details(&entry).await {
+                            Ok((new_message, new_files)) => {
+                                if let Some(Dialog::GitLog { message, files, .. }) = &mut self.dialog {
+                                    *message = new_message;
+                                    *files = new_files;
+                                }
+                            }
+                            Err(error) => self.status_msg = Some(format!("Could not load commit: {error:#}")),
+                        }
+                    }
+                    return Ok(false);
+                }
                 if let Some(button) = crate::ui::dialog_button_at(
                     &dialog,
                     Rect::new(0, 0, width, height),
@@ -1077,6 +1220,22 @@ impl App {
                     };
                     return self.handle_dialog_key(KeyEvent::new(key, KeyModifiers::NONE)).await;
                 }
+            }
+            if let Some(Dialog::GitChanges { scroll, .. }) = &mut self.dialog {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            if let Some(Dialog::GitLog { scroll, .. }) = &mut self.dialog {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
+                    _ => {}
+                }
+                return Ok(false);
             }
             if let Some(Dialog::Hover { ref mut scroll, .. }) = self.dialog {
                 match mouse.kind {
@@ -1310,6 +1469,247 @@ impl App {
                 }
                 _ => self.dialog = Some(Dialog::DockerApproval { image }),
             },
+            Some(Dialog::GitChanges { mut changes, mut selected, mut scroll }) => {
+                match key.code {
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Up => { selected = selected.saturating_sub(1); scroll = 0; }
+                    KeyCode::Down => { selected = (selected + 1).min(changes.len().saturating_sub(1)); scroll = 0; }
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        let output = Command::new("git")
+                            .args(["add", "-A"])
+                            .current_dir(&self.root_path)
+                            .output()
+                            .await?;
+                        if output.status.success() {
+                            self.status_msg = Some("All changes staged.".into());
+                            changes = self.load_git_changes().await.unwrap_or_default();
+                            selected = selected.min(changes.len().saturating_sub(1));
+                        } else {
+                            self.status_msg = Some(format!("Could not stage all changes: {}", String::from_utf8_lossy(&output.stderr).trim()));
+                        }
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        match self.load_git_changes().await {
+                            Ok(updated) => changes = updated,
+                            Err(error) => self.status_msg = Some(format!("Git refresh failed: {error:#}")),
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(change) = changes.get(selected).cloned() {
+                            match self.stage_git_change(&change).await {
+                                Ok(()) => {
+                                    self.status_msg = Some(format!("Updated staging: {}", change.path.display()));
+                                    changes = self.load_git_changes().await.unwrap_or_default();
+                                    selected = selected.min(changes.len().saturating_sub(1));
+                                }
+                                Err(error) => self.status_msg = Some(format!("Git staging failed: {error:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        if changes.iter().any(|change| change.index_status != ' ' && change.index_status != '?') {
+                            self.dialog = Some(Dialog::GitCommit { changes, selected, scroll, message: String::new() });
+                            return Ok(false);
+                        }
+                        self.status_msg = Some("Stage at least one change before committing.".into());
+                    }
+                    KeyCode::Enter => {
+                        if let Some(change) = changes.get(selected) {
+                            self.open_file_path(self.root_path.join(&change.path));
+                            return Ok(false);
+                        }
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::GitChanges { changes, selected, scroll });
+            }
+            Some(Dialog::GitCommit { changes, selected, scroll, mut message }) => {
+                match key.code {
+                    KeyCode::Esc => self.dialog = Some(Dialog::GitChanges { changes, selected, scroll }),
+                    KeyCode::Enter if !message.trim().is_empty() => {
+                        match self.commit_staged_changes(message.trim()).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                self.status_msg = Some(format!("Commit failed: {error:#}"));
+                                self.dialog = Some(Dialog::GitCommit { changes, selected, scroll, message });
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        message.pop();
+                        self.dialog = Some(Dialog::GitCommit { changes, selected, scroll, message });
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        message.push(c);
+                        self.dialog = Some(Dialog::GitCommit { changes, selected, scroll, message });
+                    }
+                    _ => self.dialog = Some(Dialog::GitCommit { changes, selected, scroll, message }),
+                }
+            }
+            Some(Dialog::GitBranches { branches, current, mut selected }) => {
+                match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                        return Ok(false);
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(branches.len().saturating_sub(1));
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                        return Ok(false);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.dialog = Some(Dialog::GitNewBranch { branches, current, selected, name: String::new() });
+                        return Ok(false);
+                    }
+                    KeyCode::Enter => {
+                        if let Some(branch) = branches.get(selected) {
+                            if branch != &current {
+                                self.pending_git_operation = Some(GitOperation::SwitchBranch(branch.clone()));
+                                self.status_msg = Some(format!("Switching to branch {branch}…"));
+                            }
+                        }
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        self.pending_git_operation = Some(GitOperation::Push);
+                        self.status_msg = Some("Pushing current branch to origin…".into());
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        self.pending_git_operation = Some(GitOperation::Pull);
+                        self.status_msg = Some("Pulling current branch (fast-forward only)…".into());
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        match self.load_git_branches().await {
+                            Ok((updated, active)) => {
+                                selected = updated.iter().position(|branch| branch == &active).unwrap_or(0);
+                                self.dialog = Some(Dialog::GitBranches { branches: updated, current: active, selected });
+                            }
+                            Err(error) => self.status_msg = Some(format!("Git branch refresh failed: {error:#}")),
+                        }
+                    }
+                    _ => self.dialog = Some(Dialog::GitBranches { branches, current, selected }),
+                }
+            }
+            Some(Dialog::GitNewBranch { branches, current, selected, mut name }) => {
+                match key.code {
+                    KeyCode::Esc => self.dialog = Some(Dialog::GitBranches { branches, current, selected }),
+                    KeyCode::Enter if !name.trim().is_empty() => {
+                        let branch_name = name.trim().to_owned();
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                        self.pending_git_operation = Some(GitOperation::CreateBranch(branch_name.clone()));
+                        self.status_msg = Some(format!("Creating branch {branch_name}…"));
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                        self.dialog = Some(Dialog::GitNewBranch { branches, current, selected, name });
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        name.push(c);
+                        self.dialog = Some(Dialog::GitNewBranch { branches, current, selected, name });
+                    }
+                    _ => self.dialog = Some(Dialog::GitNewBranch { branches, current, selected, name }),
+                }
+            }
+            Some(Dialog::GitLog {
+                mut entries,
+                mut selected,
+                mut message,
+                mut files,
+                mut selected_file,
+                mut file_focus,
+                mut expanded_file,
+                mut scroll,
+            }) => {
+                match key.code {
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Left => { file_focus = false; expanded_file = None; scroll = 0; }
+                    KeyCode::Right if !files.is_empty() => file_focus = true,
+                    KeyCode::Tab if !files.is_empty() => file_focus = !file_focus,
+                    KeyCode::Up if file_focus => {
+                        selected_file = selected_file.saturating_sub(1);
+                        expanded_file = None;
+                        scroll = 0;
+                    }
+                    KeyCode::Down if file_focus => {
+                        selected_file = (selected_file + 1).min(files.len().saturating_sub(1));
+                        expanded_file = None;
+                        scroll = 0;
+                    }
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        selected_file = 0;
+                        expanded_file = None;
+                        scroll = 0;
+                        if let Some(entry) = entries.get(selected).cloned() {
+                            match self.load_git_commit_details(&entry).await {
+                                Ok((new_message, new_files)) => { message = new_message; files = new_files; }
+                                Err(error) => self.status_msg = Some(format!("Could not load commit details: {error:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(entries.len().saturating_sub(1));
+                        selected_file = 0;
+                        expanded_file = None;
+                        scroll = 0;
+                        if let Some(entry) = entries.get(selected).cloned() {
+                            match self.load_git_commit_details(&entry).await {
+                                Ok((new_message, new_files)) => { message = new_message; files = new_files; }
+                                Err(error) => self.status_msg = Some(format!("Could not load commit details: {error:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Enter if file_focus => {
+                        if expanded_file == Some(selected_file) {
+                            expanded_file = None;
+                            scroll = 0;
+                        } else if let (Some(entry), Some(file)) = (entries.get(selected), files.get(selected_file)) {
+                            match self.load_git_file_diff(entry, file).await {
+                                Ok(diff) => {
+                                    if let Some(file) = files.get_mut(selected_file) { file.diff = Some(diff); }
+                                    expanded_file = Some(selected_file);
+                                    scroll = 0;
+                                }
+                                Err(error) => self.status_msg = Some(format!("Could not load file diff: {error:#}")),
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if !files.is_empty() { file_focus = true; }
+                    }
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        match self.load_git_log_entries().await {
+                            Ok(updated) => {
+                                entries = updated;
+                                selected = selected.min(entries.len().saturating_sub(1));
+                                selected_file = 0;
+                                expanded_file = None;
+                                scroll = 0;
+                                if let Some(entry) = entries.get(selected).cloned() {
+                                    match self.load_git_commit_details(&entry).await {
+                                        Ok((new_message, new_files)) => { message = new_message; files = new_files; }
+                                        Err(error) => self.status_msg = Some(format!("Could not load commit details: {error:#}")),
+                                    }
+                                }
+                            }
+                            Err(error) => self.status_msg = Some(format!("Git log refresh failed: {error:#}")),
+                        }
+                    }
+                    _ => {
+                        self.dialog = Some(Dialog::GitLog { entries, selected, message, files, selected_file, file_focus, expanded_file, scroll });
+                        return Ok(false);
+                    }
+                }
+                self.dialog = Some(Dialog::GitLog { entries, selected, message, files, selected_file, file_focus, expanded_file, scroll });
+            }
             Some(Dialog::BuildOutput { title, lines, diagnostics, mut selected }) => {
                 match key.code {
                     KeyCode::Esc => {}
@@ -1860,6 +2260,364 @@ impl App {
                 text: format!("'{needle}' not found"),
             });
         }
+    }
+
+    async fn open_git_review(&mut self) {
+        match self.load_git_changes().await {
+            Ok(changes) if changes.is_empty() => {
+                self.dialog = Some(Dialog::Message { text: "There are no Git changes to review.".into() });
+            }
+            Ok(changes) => self.dialog = Some(Dialog::GitChanges { changes, selected: 0, scroll: 0 }),
+            Err(error) => self.dialog = Some(Dialog::Message { text: format!("Could not read Git changes: {error:#}") }),
+        }
+    }
+
+    async fn load_git_branches(&self) -> Result<(Vec<String>, String)> {
+        let branches_output = Command::new("git")
+            .args(["branch", "--list", "--format=%(refname:short)"])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !branches_output.status.success() {
+            let detail = String::from_utf8_lossy(&branches_output.stderr).trim().to_owned();
+            anyhow::bail!("{}", if detail.is_empty() { "not inside a Git repository".to_owned() } else { detail });
+        }
+        let branches = String::from_utf8_lossy(&branches_output.stdout)
+            .lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect();
+        let current_output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        let current = String::from_utf8_lossy(&current_output.stdout).trim().to_owned();
+        Ok((branches, current))
+    }
+
+    async fn open_git_branches(&mut self) {
+        match self.load_git_branches().await {
+            Ok((branches, current)) => {
+                let selected = branches.iter().position(|branch| branch == &current).unwrap_or(0);
+                self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+            }
+            Err(error) => self.dialog = Some(Dialog::Message { text: format!("Could not read Git branches: {error:#}") }),
+        }
+    }
+
+    async fn open_git_log(&mut self) {
+        match self.load_git_log_entries().await {
+            Ok(entries) if entries.is_empty() => {
+                self.dialog = Some(Dialog::Message { text: "This repository has no commits yet.".into() });
+            }
+            Ok(entries) => {
+                let (message, files) = match self.load_git_commit_details(&entries[0]).await {
+                    Ok(details) => details,
+                    Err(error) => (format!("Could not load commit details: {error:#}"), Vec::new()),
+                };
+                self.dialog = Some(Dialog::GitLog {
+                    entries,
+                    selected: 0,
+                    message,
+                    files,
+                    selected_file: 0,
+                    file_focus: false,
+                    expanded_file: None,
+                    scroll: 0,
+                });
+            }
+            Err(error) => self.dialog = Some(Dialog::Message { text: format!("Could not read Git log: {error:#}") }),
+        }
+    }
+
+    async fn load_git_log_entries(&self) -> Result<Vec<GitCommitEntry>> {
+        let output = Command::new("git")
+            .args(["log", "-n", "100", "--date=short", "--format=%H%x00%h%x00%ad%x00%s%x00"])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!("{}", if detail.is_empty() { "not inside a Git repository".to_owned() } else { detail });
+        }
+        let fields: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .split('\0').map(|field| field.trim().to_owned()).collect();
+        let entries = fields.chunks_exact(4).filter_map(|parts| {
+            if parts[0].is_empty() { return None; }
+            Some(GitCommitEntry {
+                hash: parts[0].clone(),
+                short_hash: parts[1].clone(),
+                date: parts[2].clone(),
+                subject: parts[3].clone(),
+            })
+        }).collect();
+        Ok(entries)
+    }
+
+    async fn load_git_commit_details(&self, entry: &GitCommitEntry) -> Result<(String, Vec<GitLogFile>)> {
+        let message = Command::new("git")
+            .args(["show", "-s", "--format=%B", &entry.hash])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !message.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&message.stderr).trim());
+        }
+        let parent_info = Command::new("git")
+            .args(["rev-list", "--parents", "-n", "1", &entry.hash])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !parent_info.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&parent_info.stderr).trim());
+        }
+        let first_parent = String::from_utf8_lossy(&parent_info.stdout)
+            .split_whitespace().nth(1).map(str::to_owned);
+        let mut files_command = Command::new("git");
+        if let Some(parent) = first_parent {
+            files_command.args(["diff", "--name-status", "--find-renames", &parent, &entry.hash]);
+        } else {
+            files_command.args(["diff-tree", "--root", "--no-commit-id", "--name-status", "--find-renames", "-r", &entry.hash]);
+        }
+        let files = files_command.current_dir(&self.root_path).output().await?;
+        if !files.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&files.stderr).trim());
+        }
+        let message = String::from_utf8_lossy(&message.stdout).trim_end().to_owned();
+        let files = String::from_utf8_lossy(&files.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let status = parts.next()?.trim();
+                let first_path = parts.next()?.trim();
+                if first_path.is_empty() { return None; }
+                let (path, diff_path) = if status.starts_with('R') || status.starts_with('C') {
+                    let new_path = parts.next().unwrap_or(first_path).trim();
+                    (format!("{first_path} → {new_path}"), new_path.to_owned())
+                } else {
+                    (first_path.to_owned(), first_path.to_owned())
+                };
+                Some(GitLogFile { status: status.to_owned(), path, diff_path, diff: None })
+            })
+            .collect();
+        Ok((message, files))
+    }
+
+    async fn load_git_file_diff(&self, entry: &GitCommitEntry, file: &GitLogFile) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["show", "--root", "--no-ext-diff", "--no-color", "--find-renames", "--format=", "--unified=3", &entry.hash, "--", &file.diff_path])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        let lines: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect();
+        Ok(if lines.is_empty() { vec!["(No textual diff available)".into()] } else { lines })
+    }
+
+    async fn run_git_operation(&mut self, operation: GitOperation) {
+        if matches!(&operation, GitOperation::SwitchBranch(_))
+            && (self.editor.modified || self.buffers.iter().any(|buffer| buffer.modified))
+        {
+            self.status_msg = Some("Save or discard modified buffers before switching branches.".into());
+            return;
+        }
+        let (mut command, description) = match &operation {
+            GitOperation::CreateBranch(name) => {
+                let mut command = Command::new("git");
+                command.args(["switch", "-c", name]);
+                (command, format!("create and switch to {name}"))
+            }
+            GitOperation::SwitchBranch(name) => {
+                let mut command = Command::new("git");
+                command.args(["switch", name]);
+                (command, format!("switch to {name}"))
+            }
+            GitOperation::Push => {
+                let mut command = Command::new("git");
+                command.args(["push", "--set-upstream", "origin", "HEAD"]);
+                (command, "push current branch".to_owned())
+            }
+            GitOperation::Pull => {
+                let mut command = Command::new("git");
+                command.args(["pull", "--ff-only"]);
+                (command, "pull current branch".to_owned())
+            }
+        };
+        let output = command.current_dir(&self.root_path).output().await;
+        match output {
+            Ok(output) if output.status.success() => {
+                let response = String::from_utf8_lossy(&output.stdout);
+                let detail = response.lines().last().filter(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Git {description} completed."));
+                self.status_msg = Some(detail);
+                if matches!(&operation, GitOperation::Pull | GitOperation::SwitchBranch(_)) {
+                    if let Some(path) = self.editor.file_path.clone() {
+                        if !self.editor.modified && path.exists() {
+                            if let Ok(updated) = Editor::load_file(path) { self.activate_editor(updated); }
+                        } else if self.editor.modified && matches!(&operation, GitOperation::Pull) {
+                            self.status_msg = Some("Pull completed; the modified editor buffer was kept as-is.".into());
+                        }
+                    }
+                    for buffer in &mut self.buffers {
+                        if !buffer.modified {
+                            if let Some(path) = buffer.file_path.clone() {
+                                if path.exists() {
+                                    if let Ok(updated) = Editor::load_file(path) { *buffer = updated; }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok((branches, current)) = self.load_git_branches().await {
+                    let selected = branches.iter().position(|branch| branch == &current).unwrap_or(0);
+                    if matches!(&self.dialog, Some(Dialog::GitBranches { .. })) {
+                        self.dialog = Some(Dialog::GitBranches { branches, current, selected });
+                    }
+                }
+                self.refresh_git_line_markers().await;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                let detail = if stderr.is_empty() { stdout } else { stderr };
+                self.status_msg = Some(format!("Git {description} failed: {detail}"));
+            }
+            Err(error) => self.status_msg = Some(format!("Could not run Git {description}: {error}")),
+        }
+    }
+
+    async fn load_git_changes(&self) -> Result<Vec<GitChange>> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!("{}", if detail.is_empty() { "not inside a Git repository".to_owned() } else { detail });
+        }
+
+        let mut entries = Vec::new();
+        let mut fields = output.stdout.split(|byte| *byte == 0).filter(|field| !field.is_empty());
+        while let Some(field) = fields.next() {
+            if field.len() < 4 { continue; }
+            let index_status = field[0] as char;
+            let worktree_status = field[1] as char;
+            let path_bytes = &field[3..];
+            if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+                // With -z Git reports the destination path first and the old
+                // path second. Keep the destination for opening and staging.
+                let _old_path = fields.next();
+            }
+            let path = PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned());
+            entries.push((path, index_status, worktree_status));
+        }
+
+        let mut changes = Vec::with_capacity(entries.len());
+        for (path, index_status, worktree_status) in entries {
+            let path_arg = path.to_string_lossy().into_owned();
+            let mut diff = Command::new("git")
+                .args(["diff", "--no-ext-diff", "--no-color", "--unified=3", "HEAD", "--", &path_arg])
+                .current_dir(&self.root_path)
+                .output()
+                .await?;
+            if !diff.status.success() || diff.stdout.is_empty() {
+                if index_status == '?' {
+                    diff = Command::new("git")
+                        .args(["diff", "--no-index", "--no-ext-diff", "--no-color", "--unified=3", "--", "/dev/null", &path_arg])
+                        .current_dir(&self.root_path)
+                        .output()
+                        .await?;
+                }
+            }
+            let mut lines: Vec<String> = String::from_utf8_lossy(&diff.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            if lines.is_empty() { lines.push("(No textual diff available)".into()); }
+            changes.push(GitChange { path, index_status, worktree_status, diff: lines });
+        }
+        Ok(changes)
+    }
+
+    async fn refresh_git_line_markers(&mut self) {
+        let Some(path) = self.editor.file_path.as_ref() else {
+            self.git_changed_lines.clear();
+            return;
+        };
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let canonical_root = self.root_path.canonicalize().unwrap_or_else(|_| self.root_path.clone());
+        let relative = match canonical_path.strip_prefix(&canonical_root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => {
+                self.git_changed_lines.clear();
+                return;
+            }
+        };
+        let path_arg = relative.to_string_lossy().into_owned();
+        let output = Command::new("git")
+            .args(["diff", "--no-ext-diff", "--no-color", "--unified=0", "HEAD", "--", &path_arg])
+            .current_dir(&self.root_path)
+            .output()
+            .await;
+        let Ok(output) = output else { return; };
+        self.git_changed_lines = if output.status.success() {
+            changed_lines_from_diff(&String::from_utf8_lossy(&output.stdout))
+        } else {
+            HashSet::new()
+        };
+
+        if self.git_changed_lines.is_empty() && !path.exists() {
+            return;
+        }
+        if self.git_changed_lines.is_empty() {
+            let status = Command::new("git")
+                .args(["status", "--porcelain", "--", &path_arg])
+                .current_dir(&self.root_path)
+                .output()
+                .await;
+            if let Ok(status) = status {
+                if String::from_utf8_lossy(&status.stdout).starts_with("??") {
+                    self.git_changed_lines = (0..self.editor.lines().len()).collect();
+                }
+            }
+        }
+    }
+
+    async fn stage_git_change(&self, change: &GitChange) -> Result<()> {
+        let path = change.path.to_string_lossy();
+        let output = if change.index_status != ' ' && change.index_status != '?' {
+            Command::new("git")
+                .args(["restore", "--staged", "--", path.as_ref()])
+                .current_dir(&self.root_path)
+                .output()
+                .await?
+        } else {
+            Command::new("git")
+                .args(["add", "--", path.as_ref()])
+                .current_dir(&self.root_path)
+                .output()
+                .await?
+        };
+        if output.status.success() { Ok(()) }
+        else { anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim()) }
+    }
+
+    async fn commit_staged_changes(&mut self, message: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(&self.root_path)
+            .output()
+            .await?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!("{}", if detail.is_empty() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { detail });
+        }
+        self.status_msg = Some(String::from_utf8_lossy(&output.stdout).lines().last().unwrap_or("Commit created.").to_owned());
+        self.dialog = None;
+        self.refresh_git_line_markers().await;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -2636,11 +3394,30 @@ fn menu_hotkey_index(ch: char) -> Option<usize> {
         'e' => Some(1), // Edit
         's' => Some(2), // Search
         'r' => Some(3), // Run
-        'o' => Some(4), // Options
-        'w' => Some(5), // Window
-        'h' => Some(6), // Help
+        'g' => Some(4), // Git
+        'o' => Some(5), // Options
+        'w' => Some(6), // Window
+        'h' => Some(7), // Help
         _ => None,
     }
+}
+
+fn changed_lines_from_diff(diff: &str) -> HashSet<usize> {
+    let mut changed = HashSet::new();
+    for line in diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let Some((_, after_old)) = line.split_once(" +") else { continue; };
+        let hunk = after_old.split_whitespace().next().unwrap_or("");
+        let mut parts = hunk.split(',');
+        let Ok(start) = parts.next().unwrap_or("").parse::<usize>() else { continue; };
+        let count = parts.next().and_then(|part| part.parse::<usize>().ok()).unwrap_or(1);
+        if count == 0 {
+            changed.insert(start.saturating_sub(1));
+        } else {
+            let first = start.saturating_sub(1);
+            changed.extend(first..first.saturating_add(count));
+        }
+    }
+    changed
 }
 
 /// Return the index of the first non-separator item in `items`.
