@@ -15,12 +15,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
-use crate::app::{App, CompletionState, Dialog, FocusArea, HelpLine, SubMenuItem, SUBMENUS};
-use crate::editor::{highlight_line, TokenKind};
+use crate::app::{App, BuildDiagnostic, CompletionState, Dialog, FocusArea, HelpLine, SettingKind, SubMenuItem, SUBMENUS};
+use crate::editor::{highlight_line_for_language, TokenKind};
 
 // ---------------------------------------------------------------------------
 // Colour palette — authentic Turbo Pascal blue
@@ -48,15 +48,15 @@ pub const C_ORANGE: Color = Color::Rgb(255, 170, 0);
 pub const C_GREEN: Color = Color::Rgb(85, 255, 85);
 /// Black text on bright backgrounds.
 pub const C_BLACK: Color = Color::Rgb(0, 0, 0);
-/// Keyword color (bright cyan in editor).
-pub const C_KW: Color = Color::Rgb(85, 255, 255);
-/// String literal color (bright green).
-pub const C_STR: Color = Color::Rgb(85, 255, 85);
-/// Comment color (dark gray / italic-ish).
-pub const C_COMMENT: Color = Color::Rgb(85, 170, 85);
-/// Number color.
-pub const C_NUM: Color = Color::Rgb(255, 170, 85);
-/// Annotation color.
+/// Bright yellow reserved words for a stronger classic DOS syntax palette.
+pub const C_KW: Color = Color::Rgb(255, 255, 85);
+/// Light cyan strings stand out against the DOS blue editor.
+pub const C_STR: Color = Color::Rgb(85, 255, 255);
+/// Muted teal comments keep executable code prominent.
+pub const C_COMMENT: Color = Color::Rgb(85, 170, 170);
+/// Yellow numeric constants.
+pub const C_NUM: Color = Color::Rgb(255, 255, 85);
+/// Magenta annotations and decorators.
 pub const C_ANNOT: Color = Color::Rgb(255, 85, 255);
 
 // ---------------------------------------------------------------------------
@@ -71,14 +71,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // menu bar
+            Constraint::Length(1), // open buffer bar
             Constraint::Min(0),    // main area
             Constraint::Length(1), // status bar
         ])
         .split(area);
 
     let menu_area = rows[0];
-    let main_area = rows[1];
-    let status_area = rows[2];
+    let buffer_area = rows[1];
+    let main_area = rows[2];
+    let status_area = rows[3];
 
     // Horizontal split: file tree | editor (when tree is visible)
     let (tree_area, editor_area) = if app.show_tree {
@@ -92,6 +94,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
 
     render_menu_bar(frame, menu_area, app);
+    render_buffer_bar(frame, buffer_area, app);
     if let Some(ta) = tree_area {
         render_file_tree(frame, ta, app);
     }
@@ -107,6 +110,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else if let CompletionState::Visible { ref items, selected, .. } = app.completion.clone() {
         render_completion(frame, editor_area, app, items, selected);
     }
+}
+
+fn render_buffer_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(" ", Style::default().bg(C_DARK_GRAY))];
+    spans.push(Span::styled(
+        format!("[{}]", app.editor.display_name()),
+        Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD),
+    ));
+    for buffer in &app.buffers {
+        spans.push(Span::styled(
+            format!(" {} ", buffer.display_name()),
+            Style::default().bg(C_DARK_GRAY).fg(C_WHITE),
+        ));
+    }
+    spans.push(Span::styled(" ".repeat(area.width as usize), Style::default().bg(C_DARK_GRAY)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,11 +284,19 @@ fn render_submenu_dropdown(frame: &mut Frame, menu_area: Rect, app: &App) {
 // File tree
 // ---------------------------------------------------------------------------
 
-fn render_file_tree(frame: &mut Frame, area: Rect, app: &App) {
+fn render_file_tree(frame: &mut Frame, area: Rect, app: &mut App) {
+    let visible_rows = (area.height as usize).saturating_sub(1).max(1);
+    if app.tree_selected < app.tree_scroll {
+        app.tree_scroll = app.tree_selected;
+    } else if app.tree_selected >= app.tree_scroll + visible_rows {
+        app.tree_scroll = app.tree_selected + 1 - visible_rows;
+    }
     let items: Vec<ListItem> = app
         .tree_entries
         .iter()
         .enumerate()
+        .skip(app.tree_scroll)
+        .take(visible_rows)
         .map(|(i, entry)| {
             let is_selected = i == app.tree_selected;
             let style = if is_selected {
@@ -283,7 +310,7 @@ fn render_file_tree(frame: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .title(Span::styled(" Files ", Style::default().bg(C_GRAY).fg(C_BLACK)))
-        .borders(Borders::RIGHT)
+        .borders(Borders::RIGHT | Borders::TOP)
         .border_style(Style::default().fg(C_GRAY))
         .style(Style::default().bg(C_BLUE_LIGHT));
 
@@ -297,11 +324,19 @@ fn render_file_tree(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
     let visible_rows = area.height as usize;
-    let visible_cols = area.width as usize;
+    let gutter_width = 6usize.min(area.width as usize);
+    let visible_cols = (area.width as usize).saturating_sub(gutter_width);
+    let line_path = app
+        .editor
+        .file_path
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
 
     // Update scroll so cursor stays visible.
     let ed = &mut app.editor;
-    ed.scroll_to_cursor(visible_rows, visible_cols);
+    if !app.preserve_editor_scroll {
+        ed.scroll_to_cursor(visible_rows, visible_cols);
+    }
 
     let scroll_row = app.editor.scroll_row;
     let scroll_col = app.editor.scroll_col;
@@ -317,14 +352,18 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         if row_idx >= lines.len() {
             // Empty line below buffer.
             text_lines.push(Line::from(Span::styled(
-                " ".repeat(visible_cols),
+                format!("{}{}", " ".repeat(gutter_width), " ".repeat(visible_cols)),
                 Style::default().bg(C_BLUE).fg(C_WHITE),
             )));
             continue;
         }
 
         let raw_line = &lines[row_idx];
-        let (token_kinds, new_in_block) = highlight_line(raw_line, in_block_comment);
+        let (token_kinds, new_in_block) = highlight_line_for_language(
+            raw_line,
+            in_block_comment,
+            app.current_language.map(|language| language.id),
+        );
         in_block_comment = new_in_block;
 
         let is_cursor_line = row_idx == cursor_row;
@@ -337,13 +376,29 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         let mut spans: Vec<Span> = Vec::new();
         let display_len = visible_cols;
 
+        let has_breakpoint = line_path
+            .as_ref()
+            .and_then(|p| app.breakpoints.get(p))
+            .is_some_and(|rows| rows.contains(&row_idx));
+        spans.push(Span::styled(
+            if has_breakpoint { "●" } else { " " },
+            Style::default().bg(line_bg).fg(if has_breakpoint { C_RED } else { C_WHITE }),
+        ));
+        spans.push(Span::styled(
+            format!("{:>4} ", row_idx + 1),
+            Style::default().bg(line_bg).fg(C_CYAN),
+        ));
+
         for col_idx in scroll_col..scroll_col + display_len {
             let is_cursor_col = is_cursor_line && col_idx == cursor_col;
+            let is_selected = app.editor.is_selected(row_idx, col_idx);
 
             if col_idx >= line_char_len {
                 // Past end of line: render cursor block or blank.
                 let (fg, bg) = if is_cursor_col && app.focus == FocusArea::Editor {
                     (C_BLUE, C_WHITE) // cursor at EOL
+                } else if is_selected {
+                    (C_BLACK, C_CYAN)
                 } else {
                     (C_WHITE, line_bg)
                 };
@@ -358,13 +413,20 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
                     TokenKind::StringLiteral => C_STR,
                     TokenKind::Number => C_NUM,
                     TokenKind::Annotation => C_ANNOT,
-                    TokenKind::Normal => C_WHITE,
+                    TokenKind::Normal => C_GRAY,
                 };
 
+                let keyword_modifiers = if kind == TokenKind::Keyword {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                };
                 let (fg, bg, mods) = if is_cursor_col && app.focus == FocusArea::Editor {
                     (C_BLUE, C_WHITE, Modifier::empty())
+                } else if is_selected {
+                    (C_BLACK, C_CYAN, Modifier::empty())
                 } else {
-                    (base_fg, line_bg, Modifier::empty())
+                    (base_fg, line_bg, keyword_modifiers)
                 };
 
                 let s: String = if ch == '\t' {
@@ -486,7 +548,7 @@ fn render_completion(
 
     // Position popup below the cursor.
     let cur_screen_row = (app.editor.cursor_row - app.editor.scroll_row) as u16;
-    let cur_screen_col = (app.editor.cursor_col - app.editor.scroll_col) as u16;
+    let cur_screen_col = 6 + (app.editor.cursor_col - app.editor.scroll_col) as u16;
 
     let popup_row = (editor_area.y + cur_screen_row + 1).min(
         editor_area.y + editor_area.height - max_rows as u16 - 2,
@@ -556,8 +618,68 @@ fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, app: &App) {
         }
         Dialog::GoToLine { input } => render_goto_line_dialog(frame, area, input),
         Dialog::Message { text, .. } => render_message_dialog(frame, area, text),
-        Dialog::Hover { text } => render_hover_dialog(frame, area, text),
+        Dialog::Hover { text, scroll } => render_hover_dialog(frame, area, text, *scroll),
+        Dialog::ConfirmDiscard { .. } => render_message_dialog(
+            frame,
+            area,
+            "Unsaved changes. Press Y to discard, N or Esc to cancel.",
+        ),
+        Dialog::BuildOutput { title, lines, diagnostics, selected } => {
+            render_build_output(frame, area, title, lines, diagnostics, *selected);
+        }
+        Dialog::SettingsInput { kind, input } => {
+            let (title, label) = match kind {
+                SettingKind::Parameters => (" Run Parameters ", "Args: "),
+                SettingKind::Compiler(_) => (" Compiler Command ", "Command: "),
+            };
+            render_input_dialog(frame, area, title, input, label, 60);
+        }
     }
+}
+
+fn render_build_output(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    output: &[String],
+    diagnostics: &[BuildDiagnostic],
+    selected: usize,
+) {
+    let popup = dialog_centered(area, area.width.saturating_sub(8), area.height.saturating_sub(4));
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" {title} · ↑/↓ select or scroll · Enter jump · Esc close "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(C_BLUE).fg(C_WHITE));
+    let body_height = popup.height.saturating_sub(2) as usize;
+    let selected_line = diagnostics.get(selected).map(|d| d.output_line).unwrap_or(0);
+    let start = if diagnostics.is_empty() {
+        selected.min(output.len().saturating_sub(body_height))
+    } else {
+        selected_line.saturating_sub(body_height.saturating_sub(1))
+    };
+    let mut lines: Vec<Line> = output
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(body_height)
+        .map(|(idx, line)| {
+            let is_selected = diagnostics.get(selected).is_some_and(|d| d.output_line == idx);
+            let style = if is_selected {
+                Style::default().bg(C_YELLOW).fg(C_BLACK)
+            } else if diagnostics.iter().any(|d| d.output_line == idx) {
+                Style::default().fg(C_RED)
+            } else {
+                Style::default().fg(C_WHITE)
+            };
+            Line::from(Span::styled(line.as_str(), style))
+        })
+        .collect();
+    if output.is_empty() {
+        lines.push(Line::from("(no output)"));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn dialog_centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -571,22 +693,22 @@ fn render_help_dialog(frame: &mut Frame, area: Rect) {
         HelpLine { key: "F1",                  action: "Help" },
         HelpLine { key: "F2 / Ctrl+S",         action: "Save" },
         HelpLine { key: "F3 / Ctrl+O",         action: "Open file" },
-        HelpLine { key: "F5",                  action: "Run / Compile" },
-        HelpLine { key: "F9",                  action: "Compile" },
+        HelpLine { key: "F5",                  action: "Toggle file browser" },
+        HelpLine { key: "F6",                  action: "Hover info" },
+        HelpLine { key: "F8 / Shift+F8",       action: "Breakpoint / GDB debugger" },
+        HelpLine { key: "F9 / Ctrl+F9",        action: "Compile / Run" },
         HelpLine { key: "F10",                 action: "Activate menu bar" },
         HelpLine { key: "F12",                 action: "Go to definition" },
         HelpLine { key: "Alt+F/E/S/R/O/W/H",  action: "Open menu directly" },
         HelpLine { key: "Ctrl+Q / Alt+F4",     action: "Quit" },
         HelpLine { key: "Ctrl+Z / Ctrl+Y",     action: "Undo / Redo" },
-        HelpLine { key: "Ctrl+X",              action: "Cut line" },
-        HelpLine { key: "Ctrl+Ins",            action: "Copy line" },
-        HelpLine { key: "Shift+Ins",           action: "Paste" },
-        HelpLine { key: "Ctrl+F",              action: "Find" },
-        HelpLine { key: "Ctrl+L",              action: "Find Again" },
-        HelpLine { key: "Ctrl+H",              action: "Replace" },
+        HelpLine { key: "Ctrl+X / Ins / Shift+Ins", action: "Cut / Copy / Paste" },
+        HelpLine { key: "Shift+Arrow / Ctrl+A", action: "Select / Select all" },
+        HelpLine { key: "Ctrl+Tab / Ctrl+PgUp/Dn", action: "Cycle open buffers" },
+        HelpLine { key: "Ctrl+1..9 / Mouse",   action: "Jump to buffer / click UI" },
+        HelpLine { key: "Ctrl+F / Ctrl+L / H", action: "Find / Again / Replace" },
         HelpLine { key: "Ctrl+G",              action: "Go to Line" },
         HelpLine { key: "Ctrl+Space",          action: "Code completion" },
-        HelpLine { key: "Ctrl+B",              action: "Toggle file browser" },
         HelpLine { key: "ESC",                 action: "Close dialog / menu" },
     ];
 
@@ -703,36 +825,38 @@ fn render_message_dialog(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(para, popup);
 }
 
-fn render_hover_dialog(frame: &mut Frame, area: Rect, text: &str) {
-    let first_line = text.lines().next().unwrap_or(text);
-    let width = (first_line.len() as u16 + 8).min(70).max(30);
-    let height = (text.lines().count() as u16 + 4).min(20);
-    let popup = dialog_centered(area, width, height);
+fn render_hover_dialog(frame: &mut Frame, area: Rect, text: &str, scroll: u16) {
+    let popup = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(4).max(1),
+        height: area.height.saturating_sub(2).max(1),
+    };
     frame.render_widget(Clear, popup);
-
-    let lines: Vec<Line> = std::iter::once(Line::from(""))
-        .chain(text.lines().map(|l| {
-            Line::from(Span::styled(
-                format!("  {l}"),
-                Style::default().bg(C_GRAY).fg(C_BLACK),
-            ))
-        }))
-        .chain(std::iter::once(Line::from(Span::styled(
-            "  [Esc] close",
-            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
-        ))))
-        .collect();
-
     let block = Block::default()
-        .title(Span::styled(
-            " Hover Info ",
-            Style::default().bg(C_CYAN).fg(C_BLACK),
+        .title(Span::styled(" Hover Info ", Style::default().bg(C_CYAN).fg(C_BLACK)))
+        .title_bottom(Span::styled(
+            " ↑/↓ scroll  PgUp/PgDn page  Home/End  Esc close ",
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_GRAY))
         .style(Style::default().bg(C_GRAY));
 
-    let para = Paragraph::new(lines).block(block);
+    let inner_height = popup.height.saturating_sub(2);
+    let inner_width = popup.width.saturating_sub(2);
+    let line_width = inner_width.max(1) as usize;
+    let visual_lines: usize = text
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(line_width))
+        .sum();
+    let max_scroll = visual_lines
+        .saturating_sub(inner_height as usize)
+        .min(u16::MAX as usize) as u16;
+    let para = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(max_scroll), 0))
+        .block(block);
     frame.render_widget(para, popup);
 }
 

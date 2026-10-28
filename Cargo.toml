@@ -2,7 +2,7 @@
 name = "blueide"
 version = "0.1.0"
 edition = "2021"
-description = "A terminal-based Kotlin IDE inspired by Turbo Pascal, with LSP support"
+description = "A terminal-based multi-language IDE inspired by Turbo Pascal, with LSP and debugging support"
 license = "MIT"
 readme = "README.md"
 

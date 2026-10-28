@@ -1,12 +1,14 @@
 //! Application state and main event loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tokio::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -40,7 +42,44 @@ pub enum Dialog {
     Replace { find: String, replace_with: String, from_row: usize, focus_replace: bool },
     GoToLine { input: String },
     Message { text: String },
-    Hover { text: String },
+    Hover { text: String, scroll: u16 },
+    ConfirmDiscard { action: PendingFileAction },
+    BuildOutput {
+        title: String,
+        lines: Vec<String>,
+        diagnostics: Vec<BuildDiagnostic>,
+        selected: usize,
+    },
+    SettingsInput { kind: SettingKind, input: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum SettingKind {
+    Parameters,
+    Compiler(String),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectSettings {
+    #[serde(default)]
+    run_parameters: String,
+    #[serde(default)]
+    compiler_overrides: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildDiagnostic {
+    pub output_line: usize,
+    pub path: PathBuf,
+    pub row: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingFileAction {
+    New,
+    Open(PathBuf),
+    Quit,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +160,11 @@ const SEARCH_MENU: &[SubMenuItem] = &[
 ];
 
 const RUN_MENU: &[SubMenuItem] = &[
-    SubMenuItem { label: "Run",           shortcut: "F5"  },
-    SubMenuItem { label: "Compile",       shortcut: "F9"  },
+    SubMenuItem { label: "Run",           shortcut: "Ctrl+F9" },
+    SubMenuItem { label: "Compile",       shortcut: "F9"      },
+    SubMenuItem { label: "",             shortcut: ""     },
+    SubMenuItem { label: "Toggle Breakpoint", shortcut: "F8" },
+    SubMenuItem { label: "Debug",         shortcut: "Shift+F8" },
     SubMenuItem { label: "",             shortcut: ""     },
     SubMenuItem { label: "Parameters...", shortcut: ""    },
 ];
@@ -160,6 +202,7 @@ pub const SUBMENUS: &[&[SubMenuItem]] = &[
 
 pub struct App {
     pub editor: Editor,
+    pub buffers: Vec<Editor>,
     pub focus: FocusArea,
     pub menu_index: usize,
     /// Whether a dropdown submenu is currently open.
@@ -169,9 +212,14 @@ pub struct App {
     pub show_tree: bool,
     pub tree_entries: Vec<TreeEntry>,
     pub tree_selected: usize,
+    pub tree_scroll: usize,
+    collapsed_dirs: HashSet<PathBuf>,
+    mouse_selecting: bool,
+    pub preserve_editor_scroll: bool,
     pub dialog: Option<Dialog>,
     pub completion: CompletionState,
     pub diagnostics: HashMap<String, Vec<Diagnostic>>,
+    pub breakpoints: HashMap<PathBuf, HashSet<usize>>,
     pub lsp_available: bool,
     pub status_msg: Option<String>,
     /// Internal line clipboard (copy/cut line operations).
@@ -182,9 +230,13 @@ pub struct App {
     pub current_language: Option<&'static Language>,
     /// Short description of how the LSP was launched ("native" / "docker" / "none").
     pub lsp_launch_mode: &'static str,
+    settings: ProjectSettings,
     /// Set to `true` after a file-open that changed the language; the event
     /// loop will restart the LSP and clear this flag.
     pending_lsp_restart: bool,
+    pending_lsp_document: Option<String>,
+    pending_debugger: bool,
+    pending_run: bool,
     lsp: LspClient,
     root_path: PathBuf,
 }
@@ -214,9 +266,14 @@ impl App {
 
         let lsp = LspClient::new(root_path.clone(), server_cmd);
         let tree_entries = build_tree(&root_path);
+        let settings = std::fs::read_to_string(root_path.join(".blueide.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
 
         Ok(Self {
             editor,
+            buffers: Vec::new(),
             focus: FocusArea::Editor,
             menu_index: 0,
             submenu_open: false,
@@ -224,16 +281,25 @@ impl App {
             show_tree: true,
             tree_entries,
             tree_selected: 0,
+            tree_scroll: 0,
+            collapsed_dirs: HashSet::new(),
+            mouse_selecting: false,
+            preserve_editor_scroll: false,
             dialog: None,
             completion: CompletionState::Hidden,
             diagnostics: HashMap::new(),
+            breakpoints: HashMap::new(),
             lsp_available: false,
             status_msg: None,
             clipboard: String::new(),
             last_needle: String::new(),
             current_language,
             lsp_launch_mode,
+            settings,
             pending_lsp_restart: false,
+            pending_lsp_document: None,
+            pending_debugger: false,
+            pending_run: false,
             lsp,
             root_path,
         })
@@ -261,7 +327,7 @@ impl App {
         self.lsp_available = lsp_ok;
 
         // Notify LSP about the open file.
-        if lsp_ok {
+        if lsp_ok && !self.editor.uri().is_empty() {
             let uri = self.editor.uri();
             let text = self.editor.text();
             let lang_id = self
@@ -300,6 +366,8 @@ impl App {
             if self.pending_lsp_restart {
                 self.pending_lsp_restart = false;
                 self.restart_lsp().await;
+            } else if let Some(old_uri) = self.pending_lsp_document.take() {
+                self.switch_lsp_document(&old_uri).await;
             }
 
             // Drain any pending LSP events first (non-blocking).
@@ -313,9 +381,22 @@ impl App {
                             break; // quit
                         }
                     }
+                    Event::Mouse(mouse) => {
+                        if self.handle_mouse(mouse).await? {
+                            break;
+                        }
+                    }
                     Event::Resize(_, _) => {}
                     _ => {}
                 }
+            }
+            if self.pending_debugger {
+                self.pending_debugger = false;
+                self.run_debugger(terminal).await?;
+            }
+            if self.pending_run {
+                self.pending_run = false;
+                self.run_program(terminal).await?;
             }
         }
         Ok(())
@@ -380,14 +461,47 @@ impl App {
     // ------------------------------------------------------------------
 
     async fn handle_editor_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.preserve_editor_scroll = false;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match key.code {
             // ---- Quit ----
-            KeyCode::Char('q') if ctrl => return Ok(true),
-            KeyCode::Char('c') if ctrl => return Ok(true),
-            KeyCode::F(4) if alt => return Ok(true),
+            KeyCode::Char('q') | KeyCode::Char('c') if ctrl => {
+                if self.editor.modified {
+                    self.dialog = Some(Dialog::ConfirmDiscard { action: PendingFileAction::Quit });
+                } else {
+                    return Ok(true);
+                }
+            }
+            KeyCode::F(4) if alt => {
+                if self.editor.modified {
+                    self.dialog = Some(Dialog::ConfirmDiscard { action: PendingFileAction::Quit });
+                } else {
+                    return Ok(true);
+                }
+            }
+
+            // Borland-style build/run pair: F9 compiles, Ctrl+F9 runs.
+            KeyCode::F(9) if ctrl => self.pending_run = true,
+            KeyCode::F(9) => self.compile_project().await,
+            KeyCode::F(5) => {
+                self.show_tree = !self.show_tree;
+                self.focus = if self.show_tree { FocusArea::Tree } else { FocusArea::Editor };
+            }
+            KeyCode::F(6) => self.show_hover().await,
+            KeyCode::Tab if ctrl => self.next_buffer(),
+            KeyCode::BackTab if ctrl => self.previous_buffer(),
+            KeyCode::PageDown if ctrl => self.next_buffer(),
+            KeyCode::PageUp if ctrl => self.previous_buffer(),
+            KeyCode::Char(c) if ctrl && ('1'..='9').contains(&c) => {
+                self.select_tab((c as usize) - ('1' as usize));
+            }
+            KeyCode::F(8) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pending_debugger = true;
+                self.status_msg = Some("Starting native debugger…".into());
+            }
+            KeyCode::F(8) => self.toggle_breakpoint(),
 
             // ---- File operations ----
             KeyCode::F(2) | KeyCode::Char('s') if ctrl => self.save_file(),
@@ -448,6 +562,7 @@ impl App {
             KeyCode::Char('g') if ctrl => {
                 self.dialog = Some(Dialog::GoToLine { input: String::new() });
             }
+            KeyCode::Char('a') if ctrl => self.editor.select_all(),
 
             // ---- LSP: completion ----
             KeyCode::Char(' ') if ctrl => {
@@ -457,11 +572,6 @@ impl App {
             // ---- LSP: go to definition ----
             KeyCode::F(12) => {
                 self.go_to_definition().await;
-            }
-
-            // ---- LSP: hover ----
-            KeyCode::F(9) => {
-                self.show_hover().await;
             }
 
             // ---- Undo / Redo ----
@@ -476,11 +586,16 @@ impl App {
 
             // ---- Cut / Copy / Paste ----
             KeyCode::Char('x') if ctrl => {
-                self.clipboard = self.editor.cut_line();
+                if let Some(selected) = self.editor.selected_text() {
+                    self.clipboard = selected;
+                    self.editor.delete_selection();
+                } else {
+                    self.clipboard = self.editor.cut_line();
+                }
                 self.notify_lsp_change().await;
             }
             KeyCode::Insert if ctrl => {
-                self.clipboard = self.editor.copy_line();
+                self.clipboard = self.editor.selected_text().unwrap_or_else(|| self.editor.copy_line());
             }
             KeyCode::Insert if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if !self.clipboard.is_empty() {
@@ -491,16 +606,22 @@ impl App {
             }
 
             // ---- Cursor movement ----
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
-            KeyCode::Left if ctrl => self.editor.move_word_left(),
-            KeyCode::Right if ctrl => self.editor.move_word_right(),
-            KeyCode::Left => self.editor.move_left(),
-            KeyCode::Right => self.editor.move_right(),
-            KeyCode::Home => self.editor.move_home(),
-            KeyCode::End => self.editor.move_end(),
-            KeyCode::PageUp => self.editor.move_page_up(20),
-            KeyCode::PageDown => self.editor.move_page_down(20),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_up(); }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_down(); }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_left(); }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_right(); }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_home(); }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => { self.editor.begin_selection(); self.editor.move_end(); }
+            KeyCode::Up => { self.editor.clear_selection(); self.editor.move_up(); }
+            KeyCode::Down => { self.editor.clear_selection(); self.editor.move_down(); }
+            KeyCode::Left if ctrl => { self.editor.clear_selection(); self.editor.move_word_left(); }
+            KeyCode::Right if ctrl => { self.editor.clear_selection(); self.editor.move_word_right(); }
+            KeyCode::Left => { self.editor.clear_selection(); self.editor.move_left(); }
+            KeyCode::Right => { self.editor.clear_selection(); self.editor.move_right(); }
+            KeyCode::Home => { self.editor.clear_selection(); self.editor.move_home(); }
+            KeyCode::End => { self.editor.clear_selection(); self.editor.move_end(); }
+            KeyCode::PageUp => { self.editor.clear_selection(); self.editor.move_page_up(20); }
+            KeyCode::PageDown => { self.editor.clear_selection(); self.editor.move_page_down(20); }
 
             // ---- Text input ----
             KeyCode::Char(c) => {
@@ -651,7 +772,13 @@ impl App {
                     .unwrap_or_default();
                 self.dialog = Some(Dialog::SaveAs { input: cur });
             }
-            (0, "Exit") => return Ok(true),
+            (0, "Exit") => {
+                if self.editor.modified {
+                    self.dialog = Some(Dialog::ConfirmDiscard { action: PendingFileAction::Quit });
+                } else {
+                    return Ok(true);
+                }
+            }
 
             // ── Edit ────────────────────────────────────────────────────
             (1, "Undo") => {
@@ -705,26 +832,27 @@ impl App {
             }
 
             // ── Run ─────────────────────────────────────────────────────
-            (3, "Run") | (3, "Compile") => self.run_project().await,
+            (3, "Run") => self.pending_run = true,
+            (3, "Compile") => self.compile_project().await,
+            (3, "Toggle Breakpoint") => self.toggle_breakpoint(),
+            (3, "Debug") => self.pending_debugger = true,
             (3, "Parameters...") => {
-                self.dialog = Some(Dialog::Message {
-                    text: "No run parameters configured.".into(),
+                self.dialog = Some(Dialog::SettingsInput {
+                    kind: SettingKind::Parameters,
+                    input: self.settings.run_parameters.clone(),
                 });
             }
 
             // ── Options ─────────────────────────────────────────────────
             (4, "Compiler...") => {
-                let lang_info = match self.current_language {
-                    Some(l) => format!(
-                        "Language: {name}\nLSP server: {cmd}\nDocker image: {img}\nLaunch mode: {mode}",
-                        name = l.name,
-                        cmd = l.native_cmd,
-                        img = l.docker_image,
-                        mode = self.lsp_launch_mode,
-                    ),
-                    None => "No language detected for the current file.".into(),
-                };
-                self.dialog = Some(Dialog::Message { text: lang_info });
+                if let Some(lang) = self.current_language {
+                    self.dialog = Some(Dialog::SettingsInput {
+                        kind: SettingKind::Compiler(lang.id.into()),
+                        input: self.settings.compiler_overrides.get(lang.id).cloned().unwrap_or_default(),
+                    });
+                } else {
+                    self.dialog = Some(Dialog::Message { text: "Open a source file to configure its compiler command.".into() });
+                }
             }
             (4, "Environment...") => {
                 let lsp_status = if self.lsp_available {
@@ -733,11 +861,21 @@ impl App {
                     "LSP: inactive".into()
                 };
                 self.dialog = Some(Dialog::Message {
-                    text: format!("Editor: BlueIDE\nTheme: Turbo Pascal Classic\n{lsp_status}"),
+                    text: format!(
+                        "Project: {}\nActive buffer: {}\nTheme: Turbo Pascal blue\n{lsp_status}",
+                        self.root_path.display(),
+                        self.editor.display_name(),
+                    ),
                 });
             }
             (4, "Save Settings") => {
-                self.status_msg = Some("Settings saved.".into());
+                match serde_json::to_string_pretty(&self.settings)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| std::fs::write(self.root_path.join(".blueide.json"), json).map_err(anyhow::Error::from))
+                {
+                    Ok(()) => self.status_msg = Some("Settings saved to .blueide.json.".into()),
+                    Err(error) => self.dialog = Some(Dialog::Message { text: format!("Could not save settings: {error}") }),
+                }
             }
 
             // ── Window ───────────────────────────────────────────────────
@@ -798,18 +936,231 @@ impl App {
                 self.tree_selected =
                     (self.tree_selected + 1).min(self.tree_entries.len().saturating_sub(1));
             }
-            KeyCode::Enter => {
+            KeyCode::Right => {
+                if let Some(entry) = self.tree_entries.get(self.tree_selected) {
+                    if entry.path.is_dir() && self.collapsed_dirs.remove(&entry.path) {
+                        self.refresh_tree(Some(entry.path.clone()));
+                    }
+                }
+            }
+            KeyCode::Left => {
                 if let Some(entry) = self.tree_entries.get(self.tree_selected) {
                     let path = entry.path.clone();
-                    if path.is_file() {
-                        self.open_file_path(path);
+                    let directory = if path.is_dir() { path.clone() } else { path.parent().unwrap_or(&path).to_path_buf() };
+                    if directory != self.root_path && !self.collapsed_dirs.contains(&directory) {
+                        self.collapsed_dirs.insert(directory.clone());
+                        self.refresh_tree(Some(directory));
+                    } else if let Some(parent) = directory.parent() {
+                        if parent != self.root_path {
+                            let parent = parent.to_path_buf();
+                            self.collapsed_dirs.insert(parent.clone());
+                            self.refresh_tree(Some(parent));
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                self.activate_tree_entry(self.tree_selected);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn activate_tree_entry(&mut self, index: usize) {
+        let Some(entry) = self.tree_entries.get(index) else { return; };
+        let path = entry.path.clone();
+        if path.is_file() {
+            self.open_file_path(path);
+            self.focus = FocusArea::Editor;
+        } else if path.is_dir() {
+            if !self.collapsed_dirs.remove(&path) {
+                self.collapsed_dirs.insert(path.clone());
+            }
+            self.refresh_tree(Some(path));
+        }
+    }
+
+    async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        if let Some(Dialog::Hover { ref mut scroll, .. }) = self.dialog {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
+                _ => {}
+            }
+            return Ok(false);
+        }
+        if self.dialog.is_some() { return Ok(false); }
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let status_row = height.saturating_sub(1);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_selecting = false;
+                if mouse.row == 0 {
+                    if let Some(menu) = self.menu_at_x(mouse.column as usize) {
+                        self.menu_index = menu;
+                        self.focus = FocusArea::Menu;
+                        self.open_submenu();
+                    }
+                } else if self.submenu_open && self.submenu_hit(mouse.column as usize, mouse.row as usize, width as usize) {
+                    let item = mouse.row.saturating_sub(2) as usize;
+                    if item < SUBMENUS[self.menu_index].len() {
+                        self.submenu_open = false;
+                        let quit = self.activate_submenu_item(self.menu_index, item).await?;
+                        if self.focus == FocusArea::Menu { self.focus = FocusArea::Editor; }
+                        return Ok(quit);
+                    }
+                } else if mouse.row == 1 {
+                    if let Some(tab) = self.tab_at_x(mouse.column as usize) {
+                        self.select_tab(tab);
                         self.focus = FocusArea::Editor;
                     }
+                } else if self.show_tree && mouse.column < 24 && mouse.row >= 3 && mouse.row < status_row {
+                    let visible_index = mouse.row.saturating_sub(3) as usize;
+                    let index = self.tree_scroll + visible_index;
+                    if index < self.tree_entries.len() {
+                        self.tree_selected = index;
+                        self.focus = FocusArea::Tree;
+                        self.activate_tree_entry(index);
+                    }
+                } else if mouse.row >= 2 && mouse.row < status_row {
+                    self.preserve_editor_scroll = false;
+                    let editor_x = if self.show_tree { 24 } else { 0 };
+                    if mouse.column as usize >= editor_x {
+                        let row = self.editor.scroll_row + mouse.row.saturating_sub(2) as usize;
+                        if row < self.editor.line_count() {
+                            self.focus = FocusArea::Editor;
+                            let column = mouse.column as usize - editor_x;
+                            if column < 6 {
+                                self.editor.cursor_row = row;
+                                self.editor.clear_selection();
+                                self.toggle_breakpoint();
+                            } else {
+                                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                    self.editor.begin_selection();
+                                } else {
+                                    self.editor.clear_selection();
+                                    self.editor.cursor_row = row;
+                                    self.editor.cursor_col = self.editor.scroll_col + column - 6;
+                                    self.editor.begin_selection();
+                                }
+                                self.editor.cursor_row = row;
+                                self.editor.cursor_col = (self.editor.scroll_col + column - 6)
+                                    .min(self.editor.lines()[row].chars().count());
+                                self.mouse_selecting = true;
+                            }
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.mouse_selecting => {
+                self.preserve_editor_scroll = false;
+                self.place_mouse_cursor(mouse.column, mouse.row, width, status_row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.mouse_selecting = false,
+            MouseEventKind::ScrollUp => {
+                if mouse.row >= 2 && mouse.row < status_row && self.show_tree && mouse.column < 24 {
+                    self.focus = FocusArea::Tree;
+                    self.tree_selected = self.tree_selected.saturating_sub(3);
+                } else if mouse.row >= 2 && mouse.row < status_row {
+                    self.focus = FocusArea::Editor;
+                    self.preserve_editor_scroll = true;
+                    self.editor.scroll_row = self.editor.scroll_row.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if mouse.row >= 2 && mouse.row < status_row && self.show_tree && mouse.column < 24 {
+                    self.focus = FocusArea::Tree;
+                    self.tree_selected = (self.tree_selected + 3).min(self.tree_entries.len().saturating_sub(1));
+                } else if mouse.row >= 2 && mouse.row < status_row {
+                    self.focus = FocusArea::Editor;
+                    self.preserve_editor_scroll = true;
+                    let visible = (height as usize).saturating_sub(3).max(1);
+                    self.editor.scroll_row = (self.editor.scroll_row + 3)
+                        .min(self.editor.line_count().saturating_sub(visible));
                 }
             }
             _ => {}
         }
         Ok(false)
+    }
+
+    fn place_mouse_cursor(&mut self, column: u16, row: u16, _width: u16, status_row: u16) {
+        if row < 2 || row >= status_row { return; }
+        let editor_x = if self.show_tree { 24usize } else { 0 };
+        if (column as usize) < editor_x + 6 { return; }
+        let target_row = self.editor.scroll_row + row.saturating_sub(2) as usize;
+        if target_row >= self.editor.line_count() { return; }
+        self.editor.cursor_row = target_row;
+        self.editor.cursor_col = (self.editor.scroll_col + column as usize - editor_x - 6)
+            .min(self.editor.lines()[target_row].chars().count());
+    }
+
+    fn tab_at_x(&self, x: usize) -> Option<usize> {
+        let mut left = 1usize;
+        let active_width = self.editor.display_name().chars().count() + 2;
+        if (left..left + active_width).contains(&x) { return Some(0); }
+        left += active_width;
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            let tab_width = buffer.display_name().chars().count() + 2;
+            if (left..left + tab_width).contains(&x) { return Some(index + 1); }
+            left += tab_width;
+        }
+        None
+    }
+
+    fn menu_at_x(&self, x: usize) -> Option<usize> {
+        let mut left = 1usize;
+        for (index, label) in ["File", "Edit", "Search", "Run", "Options", "Window", "Help"].iter().enumerate() {
+            let width = label.chars().count();
+            if (left..left + width).contains(&x) { return Some(index); }
+            left += width + 2;
+        }
+        None
+    }
+
+    fn submenu_hit(&self, x: usize, y: usize, frame_width: usize) -> bool {
+        let items = SUBMENUS[self.menu_index];
+        if y < 2 || y - 2 >= items.len() { return false; }
+        let max_label = items.iter().filter(|i| !i.is_separator()).map(|i| i.label.len()).max().unwrap_or(8);
+        let max_shortcut = items.iter().filter(|i| !i.is_separator()).map(|i| i.shortcut.len()).max().unwrap_or(0);
+        let inner_width = (1 + max_label + 2 + max_shortcut + 1).max(16);
+        let popup_width = inner_width + 2;
+        let x_raw = menu_position(self.menu_index);
+        let popup_x = x_raw.min(frame_width.saturating_sub(popup_width));
+        x >= popup_x && x < popup_x + popup_width
+    }
+
+    fn refresh_tree(&mut self, select_path: Option<PathBuf>) {
+        let all_entries = build_tree(&self.root_path);
+        self.tree_entries = all_entries
+            .into_iter()
+            .filter(|entry| {
+                let mut parent = entry.path.parent();
+                while let Some(path) = parent {
+                    if self.collapsed_dirs.contains(path) { return false; }
+                    if path == self.root_path { break; }
+                    parent = path.parent();
+                }
+                true
+            })
+            .map(|mut entry| {
+                if entry.path.is_dir() {
+                    let marker = if self.collapsed_dirs.contains(&entry.path) { "▸ " } else { "▾ " };
+                    if let Some(index) = entry.display.find('▾').or_else(|| entry.display.find('▸')) {
+                        entry.display.replace_range(index..index + '▾'.len_utf8(), marker);
+                    }
+                }
+                entry
+            })
+            .collect();
+        if let Some(path) = select_path {
+            if let Some(index) = self.tree_entries.iter().position(|entry| entry.path == path) {
+                self.tree_selected = index;
+                return;
+            }
+        }
+        self.tree_selected = self.tree_selected.min(self.tree_entries.len().saturating_sub(1));
     }
 
     // ------------------------------------------------------------------
@@ -842,15 +1193,97 @@ impl App {
                     }
                 }
             }
+            Some(Dialog::ConfirmDiscard { action }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => match action {
+                    PendingFileAction::Quit => return Ok(true),
+                    action => self.apply_file_action(action),
+                },
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {}
+                _ => self.dialog = Some(Dialog::ConfirmDiscard { action }),
+            },
+            Some(Dialog::BuildOutput { title, lines, diagnostics, mut selected }) => {
+                match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.dialog = Some(Dialog::BuildOutput { title, lines, diagnostics, selected });
+                    }
+                    KeyCode::Down => {
+                        let max = if diagnostics.is_empty() { lines.len().saturating_sub(1) } else { diagnostics.len() - 1 };
+                        selected = (selected + 1).min(max);
+                        self.dialog = Some(Dialog::BuildOutput { title, lines, diagnostics, selected });
+                    }
+                    KeyCode::PageUp => {
+                        selected = selected.saturating_sub(8);
+                        self.dialog = Some(Dialog::BuildOutput { title, lines, diagnostics, selected });
+                    }
+                    KeyCode::PageDown => {
+                        let max = if diagnostics.is_empty() { lines.len().saturating_sub(1) } else { diagnostics.len() - 1 };
+                        selected = (selected + 8).min(max);
+                        self.dialog = Some(Dialog::BuildOutput { title, lines, diagnostics, selected });
+                    }
+                    KeyCode::Enter if !diagnostics.is_empty() => {
+                        let diagnostic = &diagnostics[selected.min(diagnostics.len() - 1)];
+                        let path = diagnostic.path.clone();
+                        let row = diagnostic.row;
+                        let column = diagnostic.column;
+                        if self.editor.file_path.as_ref() != Some(&path) {
+                            self.open_file_path(path.clone());
+                        }
+                        if self.editor.file_path.as_ref() == Some(&path) {
+                            self.editor.goto_line(row);
+                            self.editor.cursor_col = column.min(self.editor.lines()[self.editor.cursor_row].chars().count());
+                        }
+                    }
+                    _ => self.dialog = Some(Dialog::BuildOutput { title, lines, diagnostics, selected }),
+                }
+            }
+            Some(Dialog::SettingsInput { kind, mut input }) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    match kind {
+                        SettingKind::Parameters => self.settings.run_parameters = input,
+                        SettingKind::Compiler(language) => {
+                            if input.trim().is_empty() {
+                                self.settings.compiler_overrides.remove(&language);
+                            } else {
+                                self.settings.compiler_overrides.insert(language, input.trim().into());
+                            }
+                        }
+                    }
+                    self.status_msg = Some("Setting updated. Choose Options → Save Settings to persist it.".into());
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.dialog = Some(Dialog::SettingsInput { kind, input });
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.dialog = Some(Dialog::SettingsInput { kind, input });
+                }
+                _ => self.dialog = Some(Dialog::SettingsInput { kind, input }),
+            },
             Some(Dialog::SaveAs { mut input }) => {
                 match key.code {
                     KeyCode::Esc => {}
                     KeyCode::Enter => {
                         let path = PathBuf::from(&input);
+                        let old_uri = self.editor.uri();
+                        let old_language = self.current_language.map(|l| l.id);
                         match self.editor.save_as(path) {
                             Ok(_) => {
+                                self.current_language = self
+                                    .editor
+                                    .file_path
+                                    .as_deref()
+                                    .and_then(detect_language);
+                                if old_language != self.current_language.map(|l| l.id) {
+                                    self.pending_lsp_restart = true;
+                                } else {
+                                    self.pending_lsp_document = Some(old_uri);
+                                }
                                 self.status_msg = Some("Saved.".into());
-                                self.tree_entries = build_tree(&self.root_path);
+                                self.refresh_tree(None);
                             }
                             Err(e) => {
                                 self.dialog =
@@ -947,7 +1380,22 @@ impl App {
                     }
                 }
             }
-            Some(Dialog::Message { .. }) | Some(Dialog::Hover { .. }) => {
+            Some(Dialog::Hover { text, mut scroll }) => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => {}
+                    KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => scroll = scroll.saturating_add(1),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                    KeyCode::Home => scroll = 0,
+                    KeyCode::End => scroll = u16::MAX,
+                    _ => {}
+                }
+                if !matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.dialog = Some(Dialog::Hover { text, scroll });
+                }
+            }
+            Some(Dialog::Message { .. }) => {
                 // Any key closes.
             }
             None => {}
@@ -1013,35 +1461,56 @@ impl App {
     }
 
     fn new_file(&mut self) {
-        self.editor = Editor::default();
-        self.status_msg = Some("New file.".into());
+        if self.editor.modified {
+            self.dialog = Some(Dialog::ConfirmDiscard {
+                action: PendingFileAction::New,
+            });
+        } else {
+            self.apply_file_action(PendingFileAction::New);
+        }
     }
 
     fn open_file_path(&mut self, path: PathBuf) {
+        if self.editor.modified {
+            self.dialog = Some(Dialog::ConfirmDiscard {
+                action: PendingFileAction::Open(path),
+            });
+            return;
+        }
+        self.load_file_path(path);
+    }
+
+    fn apply_file_action(&mut self, action: PendingFileAction) {
+        match action {
+            PendingFileAction::New => {
+                let old_uri = self.editor.uri();
+                if self.editor.file_path.is_some() {
+                    self.buffers.push(self.editor.clone());
+                }
+                self.editor = Editor::default();
+                self.current_language = None;
+                self.pending_lsp_document = (!old_uri.is_empty()).then_some(old_uri);
+                self.status_msg = Some("New file.".into());
+            }
+            PendingFileAction::Open(path) => self.load_file_path(path),
+            PendingFileAction::Quit => {}
+        }
+    }
+
+    fn load_file_path(&mut self, path: PathBuf) {
+        if self.editor.file_path.as_ref() == Some(&path) {
+            self.status_msg = Some("Already open.".into());
+            return;
+        }
+        if let Some(index) = self.buffers.iter().position(|b| b.file_path.as_ref() == Some(&path)) {
+            let next = self.buffers.remove(index);
+            self.activate_editor(next);
+            return;
+        }
         match Editor::load_file(path.clone()) {
             Ok(ed) => {
-                self.editor = ed;
-                // Re-detect language — may need a new LSP server.
-                let new_lang = detect_language(&path);
-                let lang_changed = new_lang.map(|l| l.id) != self.current_language.map(|l| l.id);
-                self.current_language = new_lang;
-                if lang_changed {
-                    // Signal that the LSP must be restarted on the next run()
-                    // iteration.  We set a status message and mark the LSP as
-                    // unavailable; the actual restart happens the next time the
-                    // file is opened via `restart_lsp_for_language`.
-                    self.lsp_available = false;
-                    let lang_name = new_lang
-                        .map(|l| l.name)
-                        .unwrap_or("unknown");
-                    self.status_msg = Some(format!(
-                        "Opened · Language: {lang_name} — restarting LSP…"
-                    ));
-                    // Schedule a deferred LSP restart (picked up in event_loop).
-                    self.pending_lsp_restart = true;
-                } else {
-                    self.status_msg = Some("File opened.".into());
-                }
+                self.activate_editor(ed);
+                self.status_msg = Some("File opened.".into());
             }
             Err(e) => {
                 self.dialog = Some(Dialog::Message {
@@ -1049,6 +1518,163 @@ impl App {
                 });
             }
         }
+    }
+
+    fn activate_editor(&mut self, next: Editor) {
+        let old_uri = self.editor.uri();
+        let old_path = self.editor.file_path.clone();
+        let new_path = next.file_path.clone();
+        if old_path.is_some() && old_path != new_path {
+            self.buffers.push(self.editor.clone());
+        }
+        self.buffers.retain(|buffer| buffer.file_path != new_path);
+        self.editor = next;
+        let new_lang = self.editor.file_path.as_deref().and_then(detect_language);
+        let lang_changed = new_lang.map(|l| l.id) != self.current_language.map(|l| l.id);
+        self.current_language = new_lang;
+        if lang_changed {
+            self.lsp_available = false;
+            self.pending_lsp_restart = true;
+            self.pending_lsp_document = None;
+            let lang_name = new_lang.map(|l| l.name).unwrap_or("unknown");
+            self.status_msg = Some(format!("Language: {lang_name} — restarting LSP…"));
+        } else {
+            self.pending_lsp_document = Some(old_uri);
+        }
+    }
+
+    fn next_buffer(&mut self) {
+        if self.buffers.is_empty() {
+            self.status_msg = Some("No other open buffers.".into());
+            return;
+        }
+        self.switch_buffer(0);
+    }
+
+    fn previous_buffer(&mut self) {
+        if self.buffers.is_empty() {
+            self.status_msg = Some("No other open buffers.".into());
+            return;
+        }
+        self.switch_buffer(self.buffers.len() - 1);
+    }
+
+    /// Select an inactive-buffer slot. Slot zero is the first inactive tab.
+    fn switch_buffer(&mut self, index: usize) {
+        if index >= self.buffers.len() { return; }
+        self.preserve_editor_scroll = false;
+        let old_uri = self.editor.uri();
+        let old_language = self.current_language.map(|l| l.id);
+        let next = self.buffers.remove(index);
+        let previous = std::mem::replace(&mut self.editor, next);
+        if previous.file_path.is_some() || previous.modified {
+            self.buffers.push(previous);
+        }
+        let next_language = self.editor.file_path.as_deref().and_then(detect_language);
+        self.current_language = next_language;
+        if old_language != next_language.map(|l| l.id) {
+            self.pending_lsp_restart = true;
+            self.pending_lsp_document = None;
+        } else {
+            self.pending_lsp_document = Some(old_uri);
+        }
+        self.status_msg = Some(format!("Buffer: {}", self.editor.display_name()));
+    }
+
+    fn select_tab(&mut self, tab: usize) {
+        if tab == 0 { return; }
+        self.switch_buffer(tab - 1);
+    }
+
+    fn toggle_breakpoint(&mut self) {
+        let Some(path) = self.editor.file_path.as_ref() else {
+            self.status_msg = Some("Save this buffer before setting a breakpoint.".into());
+            return;
+        };
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let rows = self.breakpoints.entry(path.clone()).or_default();
+        if !rows.insert(self.editor.cursor_row) {
+            rows.remove(&self.editor.cursor_row);
+        }
+        let state = if rows.contains(&self.editor.cursor_row) { "set" } else { "cleared" };
+        self.status_msg = Some(format!("Breakpoint {state} at line {}.", self.editor.cursor_row + 1));
+    }
+
+    async fn run_debugger(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        if self.editor.modified {
+            self.save_file();
+            if self.editor.modified { return Ok(()); }
+        }
+        let root = self.root_path.canonicalize().unwrap_or_else(|_| self.root_path.clone());
+        let Some(source) = self.editor.file_path.clone().or_else(|| first_buildable_file(&self.tree_entries)) else {
+            self.dialog = Some(Dialog::Message { text: "No debuggable source file found in this project.".into() });
+            return Ok(());
+        };
+        let source = source.canonicalize().unwrap_or(source);
+        let source_language = detect_language(&source);
+        let compiler_override = source_language
+            .and_then(|lang| self.settings.compiler_overrides.get(lang.id))
+            .map(String::as_str);
+        let Some((mut compile_commands, binary)) = debugger_target(&source, &root) else {
+            self.dialog = Some(Dialog::Message { text: "No native debugger recipe for this source type. GDB is supported for Rust, C, C++, and Free Pascal.".into() });
+            return Ok(());
+        };
+        if let (Some(compiler), Some(command)) = (compiler_override, compile_commands.first_mut()) {
+            let replacement = parse_arguments(compiler);
+            if !replacement.is_empty() { command.splice(0..1, replacement); }
+        }
+        let mut output_lines = Vec::new();
+        for args in compile_commands {
+            output_lines.push(format!("$ {}", args.join(" ")));
+            let mut command = Command::new(&args[0]);
+            command.args(&args[1..]).current_dir(&root).kill_on_drop(true);
+            match tokio::time::timeout(Duration::from_secs(120), command.output()).await {
+                Ok(Ok(output)) => {
+                    output_lines.extend(String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned));
+                    output_lines.extend(String::from_utf8_lossy(&output.stderr).lines().map(str::to_owned));
+                    if !output.status.success() {
+                        let diagnostics = parse_build_diagnostics(&output_lines, &root);
+                        self.dialog = Some(Dialog::BuildOutput { title: "Debug build failed".into(), lines: output_lines, diagnostics, selected: 0 });
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.dialog = Some(Dialog::Message { text: format!("Could not build debug target: {error}") });
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.dialog = Some(Dialog::Message { text: "Debug build timed out after 120 seconds.".into() });
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut debugger = Command::new("gdb");
+        debugger.arg("--quiet").arg("--tui");
+        for (path, points) in &self.breakpoints {
+            for row in points {
+                debugger.arg("-ex").arg(format!("break {}:{}", path.display(), row + 1));
+            }
+        }
+        debugger.arg("-ex").arg("run").arg("--args").arg(&binary);
+        debugger.args(parse_arguments(&self.settings.run_parameters)).current_dir(&root);
+
+        terminal.show_cursor()?;
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+        let debugger_result = status_with_interrupt_guard(&mut debugger).await;
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        terminal.clear()?;
+        terminal.hide_cursor()?;
+        match debugger_result {
+            Ok(status) => self.status_msg = Some(format!("Debugger exited with {status}. Use GDB commands for step, continue, print, and backtrace.")),
+            Err(error) => self.dialog = Some(Dialog::Message { text: format!("Could not start GDB: {error}") }),
+        }
+        Ok(())
     }
 
     fn find_text(&mut self, needle: &str, from_row: usize) {
@@ -1060,9 +1686,9 @@ impl App {
         let n = lines.len();
         for offset in 0..n {
             let row = (from_row + offset) % n;
-            if let Some(col) = lines[row].find(needle) {
+            if let Some(col_byte) = lines[row].find(needle) {
                 self.editor.cursor_row = row;
-                self.editor.cursor_col = col;
+                self.editor.cursor_col = lines[row][..col_byte].chars().count();
                 return;
             }
         }
@@ -1162,6 +1788,27 @@ impl App {
         let _ = self.lsp.change_file(&uri, &text).await;
     }
 
+    async fn switch_lsp_document(&mut self, old_uri: &str) {
+        if !self.lsp_available {
+            return;
+        }
+        let new_uri = self.editor.uri();
+        if old_uri == new_uri && !new_uri.is_empty() {
+            let text = self.editor.text();
+            let _ = self.lsp.change_file(&new_uri, &text).await;
+        } else {
+            if !old_uri.is_empty() {
+                let _ = self.lsp.close_file(old_uri).await;
+            }
+            if !new_uri.is_empty() {
+                let language_id = self.current_language.map(|l| l.id).unwrap_or("plaintext");
+                let text = self.editor.text();
+                let _ = self.lsp.open_file(&new_uri, &text, language_id).await;
+            }
+        }
+        self.diagnostics.clear();
+    }
+
     async fn trigger_completion(&mut self) {
         if !self.lsp_available {
             return;
@@ -1171,7 +1818,7 @@ impl App {
             return;
         }
         let row = self.editor.cursor_row as u32;
-        let col = self.editor.cursor_col as u32;
+        let col = self.editor.lsp_character();
         match self.lsp.complete(&uri, row, col).await {
             Ok(items) if !items.is_empty() => {
                 self.completion = CompletionState::Visible { items, selected: 0 };
@@ -1194,7 +1841,7 @@ impl App {
             return;
         }
         let row = self.editor.cursor_row as u32;
-        let col = self.editor.cursor_col as u32;
+        let col = self.editor.lsp_character();
         match self.lsp.definition(&uri, row, col).await {
             Ok(locs) if !locs.is_empty() => {
                 let loc = &locs[0];
@@ -1221,8 +1868,8 @@ impl App {
                         }
                     }
                 }
-                self.editor.cursor_row = target_row;
-                self.editor.cursor_col = target_col;
+                self.editor.goto_line(target_row);
+                self.editor.set_lsp_character(target_col as u32);
             }
             Ok(_) => {
                 self.status_msg = Some("No definition found.".into());
@@ -1242,10 +1889,10 @@ impl App {
             return;
         }
         let row = self.editor.cursor_row as u32;
-        let col = self.editor.cursor_col as u32;
+        let col = self.editor.lsp_character();
         match self.lsp.hover(&uri, row, col).await {
             Ok(text) if !text.trim().is_empty() => {
-                self.dialog = Some(Dialog::Hover { text });
+                self.dialog = Some(Dialog::Hover { text, scroll: 0 });
             }
             Ok(_) => {
                 self.status_msg = Some("No hover info available.".into());
@@ -1260,25 +1907,397 @@ impl App {
     // Run / compile
     // ------------------------------------------------------------------
 
-    async fn run_project(&mut self) {
-        // Find build script or main .kt file.
-        let build_file = ["gradlew", "build.gradle.kts", "build.gradle"]
-            .iter()
-            .map(|f| self.root_path.join(f))
-            .find(|p| p.exists());
-
-        let text = if let Some(ref bf) = build_file {
-            let gradle = self.root_path.join("gradlew");
-            let cmd = if gradle.exists() { "./gradlew run" } else { "gradle run" };
-            format!("Run: {cmd}\n(in {})", bf.parent().unwrap_or(&self.root_path).display())
-        } else if let Some(ref fp) = self.editor.file_path.clone() {
-            format!("Run: kotlinc {} -include-runtime -d out.jar && java -jar out.jar", fp.display())
-        } else {
-            "No runnable project or file found.".into()
+    async fn compile_project(&mut self) {
+        if self.editor.modified {
+            self.save_file();
+            if self.editor.modified {
+                return;
+            }
+        }
+        let root = self.root_path.canonicalize().unwrap_or_else(|_| self.root_path.clone());
+        let Some(source) = self.editor.file_path.clone().or_else(|| first_buildable_file(&self.tree_entries)) else {
+            self.dialog = Some(Dialog::Message {
+                text: "No buildable source file found in this project.".into(),
+            });
+            return;
+        };
+        let source = source.canonicalize().unwrap_or(source);
+        let source_language = detect_language(&source);
+        let compiler_override = source_language
+            .and_then(|lang| self.settings.compiler_overrides.get(lang.id))
+            .map(String::as_str);
+        let Some(commands) = build_commands(&source, &root, false, &self.settings.run_parameters, compiler_override) else {
+            self.dialog = Some(Dialog::Message {
+                text: format!("No compile recipe for {}.", source.display()),
+            });
+            return;
         };
 
-        self.dialog = Some(Dialog::Message { text });
+        let title = "Compile";
+        let mut lines = Vec::new();
+        let mut failed = false;
+        for args in commands {
+            lines.push(format!("$ {}", args.join(" ")));
+            let mut command = Command::new(&args[0]);
+            command.args(&args[1..]).current_dir(&root).kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await;
+            match output {
+                Ok(Ok(output)) => {
+                    lines.extend(String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned));
+                    lines.extend(String::from_utf8_lossy(&output.stderr).lines().map(str::to_owned));
+                    if !output.status.success() {
+                        lines.push(format!("Process exited with status {}", output.status));
+                        failed = true;
+                        break;
+                    }
+                }
+                Ok(Err(error)) => {
+                    lines.push(format!("Could not start {}: {error}", args[0]));
+                    failed = true;
+                    break;
+                }
+                Err(_) => {
+                    lines.push("Process timed out after 120 seconds.".into());
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            lines.push("Completed successfully.".into());
+            self.status_msg = Some(format!("{title} completed successfully."));
+        } else {
+            self.status_msg = Some(format!("{title} finished with errors."));
+        }
+        let diagnostics = parse_build_diagnostics(&lines, &root);
+        self.dialog = Some(Dialog::BuildOutput {
+            title: format!("{title} · {} diagnostic(s)", diagnostics.len()),
+            lines,
+            diagnostics,
+            selected: 0,
+        });
     }
+
+    async fn run_program(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        if self.editor.modified {
+            self.save_file();
+            if self.editor.modified { return Ok(()); }
+        }
+        let root = self.root_path.canonicalize().unwrap_or_else(|_| self.root_path.clone());
+        let Some(source) = self.editor.file_path.clone().or_else(|| first_buildable_file(&self.tree_entries)) else {
+            self.dialog = Some(Dialog::Message { text: "No buildable source file found in this project.".into() });
+            return Ok(());
+        };
+        let source = source.canonicalize().unwrap_or(source);
+        let source_language = detect_language(&source);
+        let compiler_override = source_language
+            .and_then(|lang| self.settings.compiler_overrides.get(lang.id))
+            .map(String::as_str);
+        let Some(commands) = build_commands(&source, &root, true, &self.settings.run_parameters, compiler_override) else {
+            self.dialog = Some(Dialog::Message { text: format!("No run recipe for {}.", source.display()) });
+            return Ok(());
+        };
+        let mut lines = Vec::new();
+        let split = commands.len().saturating_sub(1);
+        for args in commands.iter().take(split) {
+            lines.push(format!("$ {}", args.join(" ")));
+            let mut command = Command::new(&args[0]);
+            command.args(&args[1..]).current_dir(&root).kill_on_drop(true);
+            match tokio::time::timeout(Duration::from_secs(120), command.output()).await {
+                Ok(Ok(output)) => {
+                    lines.extend(String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned));
+                    lines.extend(String::from_utf8_lossy(&output.stderr).lines().map(str::to_owned));
+                    if !output.status.success() {
+                        lines.push(format!("Build failed with status {}", output.status));
+                        let diagnostics = parse_build_diagnostics(&lines, &root);
+                        self.dialog = Some(Dialog::BuildOutput { title: "Run · build failed".into(), lines, diagnostics, selected: 0 });
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => {
+                    lines.push(format!("Could not start {}: {error}", args[0]));
+                    let diagnostics = parse_build_diagnostics(&lines, &root);
+                    self.dialog = Some(Dialog::BuildOutput { title: "Run · build failed".into(), lines, diagnostics, selected: 0 });
+                    return Ok(());
+                }
+                Err(_) => {
+                    lines.push("Build timed out after 120 seconds.".into());
+                    let diagnostics = parse_build_diagnostics(&lines, &root);
+                    self.dialog = Some(Dialog::BuildOutput { title: "Run · build failed".into(), lines, diagnostics, selected: 0 });
+                    return Ok(());
+                }
+            }
+        }
+
+        let run_command = &commands[commands.len() - 1];
+        lines.push(format!("$ {}", run_command.join(" ")));
+        terminal.show_cursor()?;
+        crossterm::terminal::disable_raw_mode()?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+        let mut process = Command::new(&run_command[0]);
+        process.args(&run_command[1..]).current_dir(&root);
+        let status = status_with_interrupt_guard(&mut process).await;
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        terminal.clear()?;
+        terminal.hide_cursor()?;
+        match status {
+            Ok(status) => {
+                lines.push(format!("Program exited with status {status}."));
+                self.status_msg = Some(format!("Program exited with {status}."));
+            }
+            Err(error) => {
+                lines.push(format!("Could not start {}: {error}", run_command[0]));
+                self.status_msg = Some("Could not start program.".into());
+            }
+        }
+        let diagnostics = parse_build_diagnostics(&lines, &root);
+        self.dialog = Some(Dialog::BuildOutput { title: "Run complete · Enter jumps to errors · Esc closes".into(), lines, diagnostics, selected: 0 });
+        Ok(())
+    }
+}
+
+fn build_commands(
+    source: &Path,
+    root: &Path,
+    run: bool,
+    params: &str,
+    compiler_override: Option<&str>,
+) -> Option<Vec<Vec<String>>> {
+    let ext = source.extension()?.to_str()?.to_ascii_lowercase();
+    let file = source.to_string_lossy().into_owned();
+    let mut commands = Vec::new();
+    let mut add = |parts: &[&str]| commands.push(parts.iter().map(|s| s.to_string()).collect());
+    match ext.as_str() {
+        "rs" if root.join("Cargo.toml").exists() => {
+            if run { add(&["cargo", "run"]); } else { add(&["cargo", "check"]); }
+        }
+        "rs" => {
+            let bin = std::env::temp_dir().join(format!("blueide-{}-program", std::process::id()));
+            commands.push(vec!["rustc".into(), file, "-o".into(), bin.display().to_string()]);
+            if run { commands.push(vec![bin.display().to_string()]); }
+        }
+        "kt" | "kts" if root.join("gradlew").exists() || root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() => {
+            let wrapper = if root.join("gradlew").exists() { "./gradlew" } else { "gradle" };
+            if run { commands.push(vec![wrapper.into(), "run".into()]); }
+            else { commands.push(vec![wrapper.into(), "build".into()]); }
+        }
+        "kt" | "kts" => {
+            let jar = std::env::temp_dir().join(format!("blueide-{}-program.jar", std::process::id()));
+            commands.push(vec!["kotlinc".into(), file, "-include-runtime".into(), "-d".into(), jar.display().to_string()]);
+            if run { commands.push(vec!["java".into(), "-jar".into(), jar.display().to_string()]); }
+        }
+        "py" | "pyw" => {
+            if run { commands.push(vec!["python3".into(), file]); }
+            else {
+                let cache = std::env::temp_dir().join(format!("blueide-{}-pycache", std::process::id()));
+                commands.push(vec!["python3".into(), "-X".into(), format!("pycache_prefix={}", cache.display()), "-m".into(), "py_compile".into(), file]);
+            }
+        }
+        "js" | "mjs" | "cjs" | "jsx" => {
+            if run { commands.push(vec!["node".into(), file]); }
+            else { commands.push(vec!["node".into(), "--check".into(), file]); }
+        }
+        "ts" | "tsx" => {
+            if run { commands.push(vec!["tsx".into(), file]); }
+            else { commands.push(vec!["tsc".into(), "--noEmit".into()]); }
+        }
+        "go" => {
+            if run { commands.push(vec!["go".into(), "run".into(), file]); }
+            else {
+                let bin = std::env::temp_dir().join(format!("blueide-{}-go-program", std::process::id()));
+                commands.push(vec!["go".into(), "build".into(), "-o".into(), bin.display().to_string(), file]);
+            }
+        }
+        "c" | "cc" | "cpp" | "cxx" => {
+            let bin = std::env::temp_dir().join(format!("blueide-{}-program", std::process::id()));
+            let compiler = if ext == "c" { "cc" } else { "c++" };
+            commands.push(vec![compiler.into(), file, "-o".into(), bin.display().to_string()]);
+            if run { commands.push(vec![bin.display().to_string()]); }
+        }
+        "java" => {
+            let stem = source.file_stem()?.to_string_lossy().into_owned();
+            let classes = std::env::temp_dir().join(format!("blueide-{}-java", std::process::id()));
+            let _ = std::fs::create_dir_all(&classes);
+            commands.push(vec!["javac".into(), "-d".into(), classes.display().to_string(), file.clone()]);
+            if run { commands.push(vec!["java".into(), "-cp".into(), classes.display().to_string(), stem]); }
+        }
+        "pas" | "pp" | "p" | "lpr" | "dpr" => {
+            let out_dir = std::env::temp_dir().join(format!("blueide-{}-pascal", std::process::id()));
+            let _ = std::fs::create_dir_all(&out_dir);
+            commands.push(vec!["fpc".into(), format!("-FE{}", out_dir.display()), file.clone()]);
+            if run {
+                let exe_name = source.file_stem()?.to_string_lossy().into_owned();
+                let exe = out_dir.join(executable_name(&exe_name));
+                commands.push(vec![exe.display().to_string()]);
+            }
+        }
+        _ => return None,
+    }
+    if run && !params.trim().is_empty() {
+        if let Some(last) = commands.last_mut() {
+            let arguments = parse_arguments(params);
+            if last.first().is_some_and(|cmd| cmd == "cargo") && last.get(1).is_some_and(|arg| arg == "run") {
+                last.push("--".into());
+                last.extend(arguments);
+            } else if last.first().is_some_and(|cmd| cmd.ends_with("gradle")) && last.get(1).is_some_and(|arg| arg == "run") {
+                last.push(format!("--args={}", arguments.join(" ")));
+            } else {
+                last.extend(arguments);
+            }
+        }
+    }
+    if let (Some(compiler), Some(first)) = (
+        compiler_override.filter(|s| !s.trim().is_empty()),
+        commands.first_mut(),
+    ) {
+        let mut replacement = parse_arguments(compiler);
+        if !replacement.is_empty() {
+            first.splice(0..1, replacement.drain(..));
+        }
+    }
+    Some(commands)
+}
+
+fn debugger_target(source: &Path, root: &Path) -> Option<(Vec<Vec<String>>, PathBuf)> {
+    let ext = source.extension()?.to_str()?.to_ascii_lowercase();
+    let file = source.to_string_lossy().into_owned();
+    let id = std::process::id();
+    match ext.as_str() {
+        "rs" if root.join("Cargo.toml").exists() => {
+            let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+            let mut in_package = false;
+            let name = manifest.lines().find_map(|line| {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_package = line == "[package]";
+                } else if in_package && line.starts_with("name") {
+                    return Some(line.split_once('=')?.1.trim().trim_matches('"').to_string());
+                }
+                None
+            })?;
+            let binary = root.join("target").join("debug").join(executable_name(&name.replace('-', "_")));
+            Some((vec![vec!["cargo".into(), "build".into()]], binary))
+        }
+        "rs" => {
+            let binary = std::env::temp_dir().join(format!("blueide-{id}-debug"));
+            Some((vec![vec!["rustc".into(), "-g".into(), file, "-o".into(), binary.display().to_string()]], binary))
+        }
+        "c" | "cc" | "cpp" | "cxx" => {
+            let binary = std::env::temp_dir().join(format!("blueide-{id}-debug"));
+            let compiler = if ext == "c" { "cc" } else { "c++" };
+            Some((vec![vec![compiler.into(), "-g".into(), file, "-o".into(), binary.display().to_string()]], binary))
+        }
+        "pas" | "pp" | "p" | "lpr" | "dpr" => {
+            let out_dir = std::env::temp_dir().join(format!("blueide-{id}-pascal-debug"));
+            let _ = std::fs::create_dir_all(&out_dir);
+            let stem = source.file_stem()?.to_string_lossy().into_owned();
+            let binary = out_dir.join(executable_name(&stem));
+            Some((vec![vec!["fpc".into(), "-g".into(), format!("-FE{}", out_dir.display()), file]], binary))
+        }
+        _ => None,
+    }
+}
+
+fn executable_name(stem: &str) -> String {
+    if cfg!(windows) { format!("{stem}.exe") } else { stem.to_string() }
+}
+
+async fn status_with_interrupt_guard(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let signal_guard = tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() { break; }
+        }
+    });
+    let status = command.status().await;
+    signal_guard.abort();
+    status
+}
+
+fn first_buildable_file(entries: &[TreeEntry]) -> Option<PathBuf> {
+    entries.iter().find_map(|entry| {
+        if !entry.path.is_file() { return None; }
+        let ext = entry.path.extension()?.to_str()?.to_ascii_lowercase();
+        matches!(ext.as_str(), "rs" | "kt" | "kts" | "py" | "pyw" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "go" | "c" | "cc" | "cpp" | "cxx" | "java" | "pas" | "pp" | "p" | "lpr" | "dpr")
+            .then(|| entry.path.clone())
+    })
+}
+
+fn parse_arguments(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if let Some(open) = quote {
+            if ch == open { quote = None; } else { current.push(ch); }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped { current.push('\\'); }
+    if !current.is_empty() { args.push(current); }
+    args
+}
+
+fn parse_build_diagnostics(lines: &[String], root: &Path) -> Vec<BuildDiagnostic> {
+    let mut result = Vec::new();
+    for (output_line, line) in lines.iter().enumerate() {
+        let trimmed = line.trim().trim_start_matches("-->").trim();
+        let mut parsed = None;
+        let parts: Vec<&str> = trimmed.split(':').collect();
+        for index in 1..parts.len().saturating_sub(1) {
+            if let (Ok(row), Ok(column)) = (parts[index].parse::<usize>(), parts[index + 1].parse::<usize>()) {
+                let path = PathBuf::from(parts[..index].join(":"));
+                if !path.as_os_str().is_empty() {
+                    parsed = Some((path, row, column));
+                    break;
+                }
+            }
+        }
+        if parsed.is_none() {
+            if let Some((before, after)) = trimmed.split_once(", line ") {
+                if let Ok(row) = after.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<usize>() {
+                    let path = before.trim_start_matches("File ").trim_matches('"');
+                    parsed = Some((PathBuf::from(path), row, 1));
+                }
+            }
+        }
+        if parsed.is_none() {
+            if let Some((path, rest)) = trimmed.split_once('(') {
+                if let Some((position, _)) = rest.split_once(')') {
+                    let mut coordinates = position.split(',');
+                    if let (Some(Ok(row)), Some(Ok(column))) = (
+                        coordinates.next().map(str::parse::<usize>),
+                        coordinates.next().map(str::parse::<usize>),
+                    ) {
+                        parsed = Some((PathBuf::from(path), row, column));
+                    }
+                }
+            }
+        }
+        if let Some((path, row, column)) = parsed {
+            let path = if path.is_absolute() { path } else { root.join(path) };
+            if path.is_file() {
+                result.push(BuildDiagnostic { output_line, path, row: row.saturating_sub(1), column: column.saturating_sub(1) });
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +2306,11 @@ impl App {
 
 /// Build the server argv and a human-readable launch-mode label for a given
 /// optional language.  Returns `(None, "none")` when no server is available.
+fn menu_position(index: usize) -> usize {
+    let labels = ["File", "Edit", "Search", "Run", "Options", "Window", "Help"];
+    1 + labels.iter().take(index).map(|label| label.chars().count() + 2).sum::<usize>()
+}
+
 fn resolve_server_command(
     lang: Option<&'static Language>,
     workspace: &str,
@@ -1309,7 +2333,7 @@ fn resolve_server_command(
 // Tree builder
 // ---------------------------------------------------------------------------
 
-/// Build a flat list of file-tree entries for `root`, depth ≤ 2.
+/// Build a flat list of file-tree entries for `root`, depth ≤ 8.
 pub fn build_tree(root: &Path) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
     collect_tree(root, root, 0, &mut entries);
@@ -1317,7 +2341,7 @@ pub fn build_tree(root: &Path) -> Vec<TreeEntry> {
 }
 
 fn collect_tree(root: &Path, dir: &Path, depth: usize, out: &mut Vec<TreeEntry>) {
-    if depth > 2 {
+    if depth > 8 {
         return;
     }
     let Ok(read_dir) = std::fs::read_dir(dir) else { return };
@@ -1328,6 +2352,8 @@ fn collect_tree(root: &Path, dir: &Path, depth: usize, out: &mut Vec<TreeEntry>)
     });
 
     for entry in children {
+        let Ok(file_type) = entry.file_type() else { continue; };
+        if file_type.is_symlink() { continue; }
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -1344,11 +2370,11 @@ fn collect_tree(root: &Path, dir: &Path, depth: usize, out: &mut Vec<TreeEntry>)
         }
 
         let indent = "  ".repeat(depth);
-        let prefix = if path.is_dir() { "▸ " } else { "  " };
+        let prefix = if file_type.is_dir() { "▾ " } else { "  " };
         let display = format!("{indent}{prefix}{name_str}");
         out.push(TreeEntry { path: path.clone(), display });
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_tree(root, &path, depth + 1, out);
         }
     }

@@ -1,6 +1,6 @@
 # BlueIDE
 
-A terminal-based multi-language IDE inspired by the classic Turbo Pascal blue IDE. Works entirely in the terminal with automatic Language Server Protocol (LSP) detection for 17 programming languages — native binary first, with optional Docker fallback.
+A terminal-based multi-language IDE inspired by the classic Turbo Pascal blue IDE. Works entirely in the terminal with automatic Language Server Protocol (LSP) detection for 18 programming languages — native binary first, with optional Docker fallback.
 
 ## Features
 
@@ -10,6 +10,9 @@ A terminal-based multi-language IDE inspired by the classic Turbo Pascal blue ID
 - 🔗 Multi-language LSP integration — auto-detect language from file extension, launch the right server automatically
 - 🐳 Docker fallback — if the native LSP binary is not installed, BlueIDE will try to run it inside Docker
 - ⌨️ Keyboard-driven interface (Turbo Pascal-style dropdown menus)
+- 🛠️ Compile and run recipes with diagnostic navigation
+- 🐞 GDB TUI debugging for Rust, C, C++, and Free Pascal
+- 📑 Multiple open buffers, collapsible file tree, and block selection
 - 📊 Status bar with diagnostics and language indicator
 
 ![BlueIDE screenshot](https://github.com/user-attachments/assets/5c198e68-5d0f-40fb-8ce7-b3c420ba46ec)
@@ -29,6 +32,7 @@ BlueIDE detects the language from the file extension and automatically starts th
 | C              | `.c`, `.h`                | `clangd`                      | `blueide/clangd:latest`            |
 | C++            | `.cpp`, `.cc`, `.hpp`     | `clangd`                      | `blueide/clangd:latest`            |
 | Java           | `.java`                   | `jdtls`                       | `blueide/jdtls:latest`             |
+| Pascal         | `.pas`, `.pp`, `.p`, `.lpr`, `.dpr` | `pasls`                | Native only                        |
 | Lua            | `.lua`                    | `lua-language-server`         | `blueide/lua-ls:latest`            |
 | Shell          | `.sh`, `.bash`            | `bash-language-server`        | `blueide/bash-ls:latest`           |
 | YAML           | `.yaml`, `.yml`           | `yaml-language-server`        | `blueide/yaml-ls:latest`           |
@@ -38,7 +42,7 @@ BlueIDE detects the language from the file extension and automatically starts th
 | TOML           | `.toml`                   | `taplo`                       | `blueide/taplo:latest`             |
 | Markdown       | `.md`                     | `marksman`                    | `blueide/marksman:latest`          |
 
-If a native binary is not installed **and** Docker is available, BlueIDE will automatically pull and run the server inside a Docker container with `--network=none` for security.
+If a native binary is not installed **and** Docker is available, BlueIDE will automatically pull and run the server inside a Docker container with `--network=none` for security. Pascal uses `pasls` from PATH and currently has no Docker fallback image configured.
 
 ## Requirements
 
@@ -82,21 +86,31 @@ blueide path/to/project/
 | `F1` | Help |
 | `F2` / `Ctrl+S` | Save |
 | `F3` / `Ctrl+O` | Open file |
-| `F5` | Run / compile |
-| `F9` | Hover info (LSP) |
+| `F5` | Toggle file browser |
+| `F6` | Hover info (LSP) |
+| `F8` / `Shift+F8` | Toggle breakpoint / start GDB |
+| `F9` | Compile |
+| `Ctrl+F9` | Run |
+| `Ctrl+Tab` | Switch open buffer |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next buffer |
+| `Ctrl+1`–`Ctrl+9` | Jump to a visible buffer |
 | `F10` | Activate menu bar |
 | `F12` | Go to definition (LSP) |
 | `Alt+F4` / `Ctrl+Q` | Quit |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / Redo |
-| `Ctrl+X` | Cut line |
-| `Ctrl+Ins` | Copy line |
+| `Ctrl+X` | Cut selection or line |
+| `Ctrl+Ins` | Copy selection or line |
 | `Shift+Ins` | Paste |
+| `Shift+Arrow` | Extend block selection |
+| `Ctrl+A` | Select all |
 | `Ctrl+F` | Find |
 | `Ctrl+L` | Find Again |
 | `Ctrl+H` | Replace |
 | `Ctrl+G` | Go to Line |
 | `Ctrl+Space` | Trigger completion (LSP) |
 | `Ctrl+B` | Toggle file browser |
+
+Mouse clicks select menu items, buffers, and files; click in the editor to place the cursor, drag to select text, and use the wheel to scroll.
 
 ## LSP Setup
 
@@ -108,6 +122,10 @@ BlueIDE automatically detects the file language and tries to launch the appropri
 3. LSP disabled (editing still works, just without LSP features)
 
 You can verify what was detected in the status bar (shows `[Language]` or `[Language·🐳]` for Docker) or via `Options → Compiler...` in the menu.
+
+Pascal files use `pasls` when it is installed. Install Free Pascal (`fpc`) to compile and run Pascal files; GDB is used for native debugging when available. `Shift+F8` starts the native GDB TUI for Rust, C, C++, and Pascal. Set breakpoints with `F8`; GDB provides stepping, watches (`print`), and the call stack (`backtrace`).
+
+Compile and run use `F9` and `Ctrl+F9`. Compiler output appears in an IDE dialog; select a diagnostic and press Enter to jump to its source location. Run temporarily returns to the terminal so programs can read input. Compiler overrides and run parameters are configured under Options and saved in the project root as `.blueide.json`.
 
 ## Development
 

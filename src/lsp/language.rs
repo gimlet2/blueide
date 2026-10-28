@@ -140,6 +140,19 @@ const LANGUAGES: &[ExtMapping] = &[
         },
     },
     ExtMapping {
+        exts: &["pas", "pp", "p", "lpr", "dpr"],
+        language: Language {
+            id: "pascal",
+            name: "Pascal",
+            native_cmd: "pasls",
+            native_args: &[],
+            // No maintained public container image is configured. Use pasls
+            // from PATH instead of attempting an invalid Docker fallback.
+            docker_image: "",
+            docker_server_cmd: &[],
+        },
+    },
+    ExtMapping {
         exts: &["lua"],
         language: Language {
             id: "lua",
@@ -324,7 +337,7 @@ pub fn resolve_server(
     }
 
     // Native binary absent — try Docker.
-    if which_in_path("docker").is_some() {
+    if !lang.docker_image.is_empty() && which_in_path("docker").is_some() {
         return Some(ServerLaunch::Docker {
             image: lang.docker_image.to_string(),
             workspace_path: workspace_path.to_string(),

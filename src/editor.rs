@@ -12,7 +12,7 @@ pub struct Editor {
     lines: Vec<String>,
     /// Zero-based cursor row.
     pub cursor_row: usize,
-    /// Zero-based cursor column (byte offset within the line).
+    /// Zero-based cursor column measured in Unicode scalar values.
     pub cursor_col: usize,
     /// First visible row (vertical scroll offset).
     pub scroll_row: usize,
@@ -22,6 +22,7 @@ pub struct Editor {
     pub file_path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub modified: bool,
+    selection_anchor: Option<(usize, usize)>,
     /// Simple undo history: snapshots of (lines, cursor_row, cursor_col).
     undo_stack: Vec<(Vec<String>, usize, usize)>,
     /// Redo history (rebuilt on undo, cleared on new edits).
@@ -38,6 +39,7 @@ impl Default for Editor {
             scroll_col: 0,
             file_path: None,
             modified: false,
+            selection_anchor: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -113,6 +115,7 @@ impl Editor {
         self.scroll_row = 0;
         self.scroll_col = 0;
         self.modified = false;
+        self.selection_anchor = None;
     }
 
     /// Return the display name: file name or `[No Name]`.
@@ -130,6 +133,101 @@ impl Editor {
             Some(p) => crate::lsp::url_from_path(p),
             None => String::new(),
         }
+    }
+
+    /// Convert the cursor column to the UTF-16 code-unit offset used by LSP.
+    pub fn lsp_character(&self) -> u32 {
+        self.lines[self.cursor_row]
+            .chars()
+            .take(self.cursor_col)
+            .map(char::len_utf16)
+            .sum::<usize>() as u32
+    }
+
+    /// Move the cursor to an LSP UTF-16 position on the current line.
+    pub fn set_lsp_character(&mut self, character: u32) {
+        let mut units = 0u32;
+        let mut column = 0usize;
+        for ch in self.lines[self.cursor_row].chars() {
+            let width = ch.len_utf16() as u32;
+            if units + width > character {
+                break;
+            }
+            units += width;
+            column += 1;
+        }
+        self.cursor_col = column;
+    }
+
+    pub fn begin_selection(&mut self) {
+        self.selection_anchor.get_or_insert((self.cursor_row, self.cursor_col));
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some_and(|anchor| anchor != (self.cursor_row, self.cursor_col))
+    }
+
+    pub fn is_selected(&self, row: usize, col: usize) -> bool {
+        let Some(anchor) = self.selection_anchor.filter(|_| self.has_selection()) else { return false; };
+        let (start, end) = if anchor <= (self.cursor_row, self.cursor_col) {
+            (anchor, (self.cursor_row, self.cursor_col))
+        } else {
+            ((self.cursor_row, self.cursor_col), anchor)
+        };
+        (row, col) >= start && (row, col) < end
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        if !self.has_selection() { return None; }
+        let anchor = self.selection_anchor?;
+        let (start, end) = if anchor <= (self.cursor_row, self.cursor_col) {
+            (anchor, (self.cursor_row, self.cursor_col))
+        } else {
+            ((self.cursor_row, self.cursor_col), anchor)
+        };
+        let mut selected = Vec::new();
+        for row in start.0..=end.0 {
+            let chars: Vec<char> = self.lines[row].chars().collect();
+            let from = if row == start.0 { start.1 } else { 0 };
+            let to = if row == end.0 { end.1 } else { chars.len() };
+            selected.push(chars[from.min(chars.len())..to.min(chars.len())].iter().collect::<String>());
+        }
+        Some(selected.join("\n"))
+    }
+
+    pub fn select_all(&mut self) {
+        self.selection_anchor = Some((0, 0));
+        self.goto_line(self.lines.len().saturating_sub(1));
+        self.move_end();
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        self.delete_selection_inner(true)
+    }
+
+    fn delete_selection_inner(&mut self, record_undo: bool) -> bool {
+        let Some(anchor) = self.selection_anchor.filter(|_| self.has_selection()) else { return false; };
+        let (start, end) = if anchor <= (self.cursor_row, self.cursor_col) {
+            (anchor, (self.cursor_row, self.cursor_col))
+        } else {
+            ((self.cursor_row, self.cursor_col), anchor)
+        };
+        if record_undo { self.push_undo(); }
+        let prefix: String = self.lines[start.0].chars().take(start.1).collect();
+        let suffix: String = self.lines[end.0].chars().skip(end.1).collect();
+        self.lines[start.0] = prefix + &suffix;
+        if end.0 > start.0 {
+            self.lines.drain(start.0 + 1..=end.0);
+        }
+        self.cursor_row = start.0;
+        self.cursor_col = start.1;
+        self.selection_anchor = None;
+        self.modified = true;
+        true
     }
 
     // ------------------------------------------------------------------
@@ -236,7 +334,13 @@ impl Editor {
 
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
-        self.push_undo();
+        if self.has_selection() {
+            self.push_undo();
+            self.delete_selection_inner(false);
+        } else {
+            self.clear_selection();
+            self.push_undo();
+        }
         let col = self.cursor_col;
         let line = &mut self.lines[self.cursor_row];
         // Ensure we insert at a valid char boundary.
@@ -248,7 +352,13 @@ impl Editor {
 
     /// Insert a newline, splitting the current line at the cursor.
     pub fn insert_newline(&mut self) {
-        self.push_undo();
+        if self.has_selection() {
+            self.push_undo();
+            self.delete_selection_inner(false);
+        } else {
+            self.clear_selection();
+            self.push_undo();
+        }
         let col = self.cursor_col;
         let byte_pos = char_to_byte(&self.lines[self.cursor_row], col);
         let rest = self.lines[self.cursor_row].split_off(byte_pos);
@@ -267,6 +377,8 @@ impl Editor {
 
     /// Delete the character before the cursor (Backspace).
     pub fn delete_backward(&mut self) {
+        if self.delete_selection() { return; }
+        self.clear_selection();
         self.push_undo();
         if self.cursor_col > 0 {
             let byte_pos = char_to_byte(&self.lines[self.cursor_row], self.cursor_col);
@@ -288,6 +400,8 @@ impl Editor {
 
     /// Delete the character under the cursor (Delete).
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() { return; }
+        self.clear_selection();
         self.push_undo();
         if self.cursor_col < self.current_line_len() {
             let byte_pos = char_to_byte(&self.lines[self.cursor_row], self.cursor_col);
@@ -461,7 +575,7 @@ fn prev_char_boundary(s: &str, byte_pos: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Kotlin syntax highlighting helper
+// Multilanguage syntax highlighting helper
 // ---------------------------------------------------------------------------
 
 /// Classify each character position in a line for syntax highlighting.
@@ -477,6 +591,15 @@ pub enum TokenKind {
 
 /// Returns a vector of `TokenKind` for each character in `line`.
 pub fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<TokenKind>, bool) {
+    highlight_line_for_language(line, in_block_comment, None)
+}
+
+/// Highlight a line using language-specific comment delimiters.
+pub fn highlight_line_for_language(
+    line: &str,
+    in_block_comment: bool,
+    language_id: Option<&str>,
+) -> (Vec<TokenKind>, bool) {
     const KEYWORDS: &[&str] = &[
         "abstract", "actual", "annotation", "as", "break", "by", "catch", "class",
         "companion", "const", "constructor", "continue", "crossinline", "data",
@@ -488,7 +611,26 @@ pub fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<TokenKind>, bo
         "protected", "public", "receiver", "reified", "return", "sealed",
         "set", "setparam", "super", "suspend", "tailrec", "this", "throw",
         "true", "try", "typealias", "typeof", "val", "value", "var", "vararg",
-        "when", "where", "while",
+        "when", "where", "while", "fn", "let", "mut", "pub", "use", "mod",
+        "crate", "self", "impl", "trait", "match", "async", "await", "move",
+        "ref", "dyn", "unsafe", "extern", "loop", "macro_rules", "def", "lambda",
+        "pass", "yield", "with", "from", "not", "elif", "except", "raise",
+        "del", "global", "nonlocal", "assert", "print", "var", "function",
+        "export", "default", "let", "new", "delete", "typeof", "instanceof",
+        "switch", "case", "extends", "implements", "static", "void", "int",
+        "char", "float", "double", "bool", "boolean", "string", "public",
+        "protected", "synchronized", "volatile", "throws", "throw", "package",
+        "import", "true", "false", "null", "undefined", "console",
+    ];
+    const PASCAL_KEYWORDS: &[&str] = &[
+        "absolute", "and", "array", "as", "asm", "begin", "case", "class", "const",
+        "constructor", "destructor", "div", "do", "downto", "else", "end", "except",
+        "exports", "file", "finalization", "finally", "for", "function", "goto", "if",
+        "implementation", "in", "inherited", "initialization", "interface", "is", "label",
+        "library", "mod", "nil", "not", "object", "of", "on", "operator", "or", "out",
+        "packed", "procedure", "program", "property", "raise", "record", "repeat", "resourcestring",
+        "set", "shl", "shr", "then", "threadvar", "to", "try", "type", "unit", "until",
+        "uses", "var", "while", "with", "xor",
     ];
 
     let chars: Vec<char> = line.chars().collect();
@@ -502,9 +644,10 @@ pub fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<TokenKind>, bo
     while i < len {
         if in_block {
             kinds[i] = TokenKind::Comment;
-            if i + 1 < len && chars[i] == '*' && chars[i + 1] == '/' {
-                kinds[i + 1] = TokenKind::Comment;
-                i += 2;
+            if (language_id == Some("pascal") && chars[i] == '}')
+                || (i + 1 < len && chars[i] == '*' && (chars[i + 1] == '/' || chars[i + 1] == ')')) {
+                if chars[i] == '*' && i + 1 < len { kinds[i + 1] = TokenKind::Comment; }
+                i += if chars[i] == '}' { 1 } else { 2 };
                 in_block = false;
             } else {
                 i += 1;
@@ -521,10 +664,14 @@ pub fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<TokenKind>, bo
         }
 
         // Block comment start.
-        if !in_string && !in_char && i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+        if !in_string && !in_char && (
+            (language_id == Some("pascal") && chars[i] == '{')
+                || (i + 1 < len && ((chars[i] == '/' && chars[i + 1] == '*') || (chars[i] == '(' && chars[i + 1] == '*')))
+        ) {
             kinds[i] = TokenKind::Comment;
-            kinds[i + 1] = TokenKind::Comment;
-            i += 2;
+            let two_char = i + 1 < len && chars[i] != '{';
+            if two_char { kinds[i + 1] = TokenKind::Comment; }
+            i += if two_char { 2 } else { 1 };
             in_block = true;
             continue;
         }
@@ -605,7 +752,8 @@ pub fn highlight_line(line: &str, in_block_comment: bool) -> (Vec<TokenKind>, bo
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            let kind = if KEYWORDS.contains(&word.as_str()) {
+            let lowercase_word = word.to_ascii_lowercase();
+            let kind = if KEYWORDS.contains(&lowercase_word.as_str()) || PASCAL_KEYWORDS.contains(&lowercase_word.as_str()) {
                 TokenKind::Keyword
             } else {
                 TokenKind::Normal

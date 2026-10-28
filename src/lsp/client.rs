@@ -152,7 +152,22 @@ impl LspClient {
         // Perform LSP initialize handshake.
         let root_uri = url_from_path(&self.root_path);
         let init_req = initialize_request(self.alloc_id(), &root_uri);
-        self.send_request(init_req).await?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.send_request(init_req),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                self.outgoing_tx.take();
+                return Err(e.context("LSP initialize failed"));
+            }
+            Err(_) => {
+                self.outgoing_tx.take();
+                return Err(anyhow::anyhow!("LSP initialize timed out after 10 seconds"));
+            }
+        }
         self.send_notification(initialized_notification()).await?;
 
         self.initialized = true;
@@ -166,7 +181,11 @@ impl LspClient {
             return;
         }
         let id = self.alloc_id();
-        let _ = self.send_request(shutdown_request(id)).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.send_request(shutdown_request(id)),
+        )
+        .await;
         let _ = self.send_notification(exit_notification()).await;
         if let Some(tx) = self.outgoing_tx.take() {
             let _ = tx.send(OutgoingMsg::Shutdown);
