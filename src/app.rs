@@ -9,13 +9,16 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::editor::Editor;
 use crate::lsp::{
     detect_language, resolve_server, CompletionItem, Diagnostic, Language, LspClient, LspEvent,
 };
+
+const AUTOSAVE_IDLE: Duration = Duration::from_millis(900);
 
 // ---------------------------------------------------------------------------
 // Focus and mode
@@ -43,6 +46,7 @@ pub enum Dialog {
     GoToLine { input: String },
     Message { text: String },
     Hover { text: String, scroll: u16 },
+    DockerApproval { image: String },
     ConfirmDiscard { action: PendingFileAction },
     BuildOutput {
         title: String,
@@ -237,6 +241,9 @@ pub struct App {
     pending_lsp_document: Option<String>,
     pending_debugger: bool,
     pending_run: bool,
+    pending_docker: Option<(String, Vec<String>)>,
+    pending_docker_approval: bool,
+    enhanced_keyboard: bool,
     lsp: LspClient,
     root_path: PathBuf,
 }
@@ -261,8 +268,13 @@ impl App {
 
         // Resolve the LSP server command + track how we launched it.
         let root_str = root_path.to_string_lossy().into_owned();
-        let (server_cmd, lsp_launch_mode) =
+        let (mut server_cmd, lsp_launch_mode) =
             resolve_server_command(current_language, &root_str);
+        let pending_docker = if lsp_launch_mode == "docker" {
+            server_cmd.take().and_then(|argv| docker_image_from_argv(&argv).map(|image| (image, argv)))
+        } else {
+            None
+        };
 
         let lsp = LspClient::new(root_path.clone(), server_cmd);
         let tree_entries = build_tree(&root_path);
@@ -300,6 +312,9 @@ impl App {
             pending_lsp_document: None,
             pending_debugger: false,
             pending_run: false,
+            pending_docker,
+            pending_docker_approval: false,
+            enhanced_keyboard: false,
             lsp,
             root_path,
         })
@@ -311,6 +326,9 @@ impl App {
 
     pub async fn run(&mut self) -> Result<()> {
         // Set up terminal.
+        let enhanced_keys = crossterm::terminal::supports_keyboard_enhancement()
+            .unwrap_or(false);
+        self.enhanced_keyboard = enhanced_keys;
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         crossterm::execute!(
@@ -318,23 +336,25 @@ impl App {
             crossterm::terminal::EnterAlternateScreen,
             crossterm::event::EnableMouseCapture,
         )?;
+        if enhanced_keys {
+            crossterm::execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            )?;
+        } else {
+            self.status_msg = Some("Terminal cannot distinguish Shift+Enter; use Ctrl+J to insert below.".into());
+        }
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
 
-        // Start LSP (non-blocking — if KLS not installed, just skip).
-        let lsp_ok = self.lsp.start().await.unwrap_or(false);
-        self.lsp_available = lsp_ok;
-
-        // Notify LSP about the open file.
-        if lsp_ok && !self.editor.uri().is_empty() {
-            let uri = self.editor.uri();
-            let text = self.editor.text();
-            let lang_id = self
-                .current_language
-                .map(|l| l.id)
-                .unwrap_or("plaintext");
-            let _ = self.lsp.open_file(&uri, &text, lang_id).await;
+        // Ask before a Docker fallback can pull or run a language server.
+        if let Some((image, _)) = &self.pending_docker {
+            self.dialog = Some(Dialog::DockerApproval { image: image.clone() });
+        } else {
+            if let Err(error) = self.start_lsp_for_current_document().await {
+                self.status_msg = Some(format!("LSP startup failed: {error:#}"));
+            }
         }
 
         let result = self.event_loop(&mut terminal).await;
@@ -342,11 +362,20 @@ impl App {
         // Restore terminal.
         self.lsp.stop().await;
         crossterm::terminal::disable_raw_mode()?;
-        crossterm::execute!(
-            terminal.backend_mut(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
-        )?;
+        if enhanced_keys {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                PopKeyboardEnhancementFlags,
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+            )?;
+        } else {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::LeaveAlternateScreen,
+                crossterm::event::DisableMouseCapture,
+            )?;
+        }
         terminal.show_cursor()?;
 
         result
@@ -377,13 +406,21 @@ impl App {
             if event::poll(tick)? {
                 match event::read()? {
                     Event::Key(key) => {
+                        let dialog_was_open = self.dialog.is_some();
                         if self.handle_key(key).await? {
                             break; // quit
                         }
+                        if dialog_was_open && self.dialog.is_none() {
+                            terminal.clear()?;
+                        }
                     }
                     Event::Mouse(mouse) => {
+                        let dialog_was_open = self.dialog.is_some();
                         if self.handle_mouse(mouse).await? {
                             break;
+                        }
+                        if dialog_was_open && self.dialog.is_none() {
+                            terminal.clear()?;
                         }
                     }
                     Event::Resize(_, _) => {}
@@ -398,6 +435,14 @@ impl App {
                 self.pending_run = false;
                 self.run_program(terminal).await?;
             }
+            if self.pending_docker_approval {
+                self.pending_docker_approval = false;
+                self.dialog = None;
+                self.status_msg = Some("Preparing Docker language server…".into());
+                terminal.draw(|f| crate::ui::render(f, self))?;
+                self.approve_docker_lsp().await;
+            }
+            self.autosave_idle_buffers();
         }
         Ok(())
     }
@@ -624,8 +669,37 @@ impl App {
             KeyCode::PageDown => { self.editor.clear_selection(); self.editor.move_page_down(20); }
 
             // ---- Text input ----
+            KeyCode::Char('j') if ctrl => {
+                self.editor.insert_newline_below();
+                self.notify_lsp_change().await;
+            }
+            KeyCode::Char('\n') => {
+                self.editor.insert_newline_below();
+                self.notify_lsp_change().await;
+            }
             KeyCode::Char(c) => {
-                self.editor.insert_char(c);
+                if let Some(close) = match c {
+                    '(' => Some(')'), '[' => Some(']'), '{' => Some('}'),
+                    _ => None,
+                } {
+                    self.editor.insert_pair(c, close);
+                } else if matches!(c, ')' | ']' | '}')
+                    && self.editor.lines()[self.editor.cursor_row]
+                        .chars()
+                        .nth(self.editor.cursor_col) == Some(c)
+                {
+                    self.editor.move_right();
+                } else {
+                    self.editor.insert_char(c);
+                }
+                self.notify_lsp_change().await;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.editor.insert_newline_below();
+                self.notify_lsp_change().await;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.editor.insert_newline_below();
                 self.notify_lsp_change().await;
             }
             KeyCode::Enter => {
@@ -982,15 +1056,37 @@ impl App {
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
-        if let Some(Dialog::Hover { ref mut scroll, .. }) = self.dialog {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
-                MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
-                _ => {}
+        if let Some(dialog) = self.dialog.clone() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                if let Some(button) = crate::ui::dialog_button_at(
+                    &dialog,
+                    Rect::new(0, 0, width, height),
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    let key = match dialog {
+                        Dialog::DockerApproval { .. } if button == 0 => KeyCode::Char('y'),
+                        Dialog::DockerApproval { .. } => KeyCode::Esc,
+                        Dialog::ConfirmDiscard { .. } if button == 0 => KeyCode::Char('y'),
+                        Dialog::ConfirmDiscard { .. } => KeyCode::Char('n'),
+                        Dialog::BuildOutput { .. } => KeyCode::Esc,
+                        Dialog::Message { .. } => KeyCode::Enter,
+                        _ if button == 0 => KeyCode::Enter,
+                        _ => KeyCode::Esc,
+                    };
+                    return self.handle_dialog_key(KeyEvent::new(key, KeyModifiers::NONE)).await;
+                }
+            }
+            if let Some(Dialog::Hover { ref mut scroll, .. }) = self.dialog {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
+                    _ => {}
+                }
             }
             return Ok(false);
         }
-        if self.dialog.is_some() { return Ok(false); }
         let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
         let status_row = height.saturating_sub(1);
         match mouse.kind {
@@ -1200,6 +1296,19 @@ impl App {
                 },
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {}
                 _ => self.dialog = Some(Dialog::ConfirmDiscard { action }),
+            },
+            Some(Dialog::DockerApproval { image }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter | KeyCode::Char('\n') => {
+                    self.dialog = None;
+                    self.pending_docker_approval = true;
+                    self.status_msg = Some("Preparing Docker language server…".into());
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.pending_docker = None;
+                    self.lsp_launch_mode = "none";
+                    self.status_msg = Some(format!("Docker LSP declined ({image})."));
+                }
+                _ => self.dialog = Some(Dialog::DockerApproval { image }),
             },
             Some(Dialog::BuildOutput { title, lines, diagnostics, mut selected }) => {
                 match key.code {
@@ -1460,6 +1569,28 @@ impl App {
         }
     }
 
+    fn autosave_idle_buffers(&mut self) {
+        let mut saved = Vec::new();
+        let mut failures = Vec::new();
+
+        for editor in std::iter::once(&mut self.editor).chain(self.buffers.iter_mut()) {
+            if !editor.autosave_due(AUTOSAVE_IDLE) {
+                continue;
+            }
+            let name = editor.display_name();
+            match editor.save() {
+                Ok(()) => saved.push(name),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+
+        if !failures.is_empty() {
+            self.status_msg = Some(format!("Autosave failed — {}", failures.join("; ")));
+        } else if !saved.is_empty() {
+            self.status_msg = Some(format!("Autosaved {}", saved.join(", ")));
+        }
+    }
+
     fn new_file(&mut self) {
         if self.editor.modified {
             self.dialog = Some(Dialog::ConfirmDiscard {
@@ -1664,10 +1795,19 @@ impl App {
 
         terminal.show_cursor()?;
         crossterm::terminal::disable_raw_mode()?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+        if self.enhanced_keyboard {
+            crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+        }
         let debugger_result = status_with_interrupt_guard(&mut debugger).await;
+        if self.enhanced_keyboard {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            )?;
+        }
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
         terminal.clear()?;
         terminal.hide_cursor()?;
         match debugger_result {
@@ -1735,14 +1875,33 @@ impl App {
         self.diagnostics.clear();
 
         let root_str = self.root_path.to_string_lossy().into_owned();
-        let (server_cmd, launch_mode) =
+        let (mut server_cmd, launch_mode) =
             resolve_server_command(self.current_language, &root_str);
         self.lsp_launch_mode = launch_mode;
+
+        if launch_mode == "docker" {
+            self.pending_docker = server_cmd
+                .take()
+                .and_then(|argv| docker_image_from_argv(&argv).map(|image| (image, argv)));
+            self.lsp = LspClient::new(self.root_path.clone(), None);
+            self.dialog = self.pending_docker.as_ref().map(|(image, _)| {
+                Dialog::DockerApproval { image: image.clone() }
+            });
+            return;
+        }
+        self.pending_docker = None;
 
         // Create a brand-new client.
         self.lsp = LspClient::new(self.root_path.clone(), server_cmd);
 
-        let lsp_ok = self.lsp.start().await.unwrap_or(false);
+        let lsp_ok = match self.lsp.start().await {
+            Ok(available) => available,
+            Err(error) => {
+                self.lsp_available = false;
+                self.status_msg = Some(format!("LSP startup failed: {error:#}"));
+                return;
+            }
+        };
         self.lsp_available = lsp_ok;
 
         if lsp_ok {
@@ -1773,6 +1932,78 @@ impl App {
                     .map(|l| l.native_cmd)
                     .unwrap_or("language server"),
             ));
+        }
+    }
+
+    async fn start_lsp_for_current_document(&mut self) -> Result<bool> {
+        let lsp_ok = self.lsp.start().await?;
+        self.lsp_available = lsp_ok;
+        if lsp_ok && !self.editor.uri().is_empty() {
+            let uri = self.editor.uri();
+            let text = self.editor.text();
+            let lang_id = self.current_language.map(|l| l.id).unwrap_or("plaintext");
+            let _ = self.lsp.open_file(&uri, &text, lang_id).await;
+        }
+        Ok(lsp_ok)
+    }
+
+    async fn approve_docker_lsp(&mut self) {
+        let Some((image, argv)) = self.pending_docker.take() else { return; };
+        self.status_msg = Some(format!("Checking Docker image {image}…"));
+        let image_exists = Command::new("docker")
+            .args(["image", "inspect", image.as_str()])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !image_exists {
+            self.status_msg = Some(format!("Pulling Docker image {image}…"));
+            let pull = Command::new("docker")
+                .args(["pull", image.as_str()])
+                .output()
+                .await;
+            match pull {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                    self.lsp_launch_mode = "none";
+                    let message = if detail.is_empty() {
+                        format!("Could not pull {image} (docker exited with {}).", output.status)
+                    } else {
+                        format!("Could not pull {image}: {detail}")
+                    };
+                    self.status_msg = Some(message.clone());
+                    self.dialog = Some(Dialog::Message { text: message });
+                    return;
+                }
+                Err(error) => {
+                    self.lsp_launch_mode = "none";
+                    let message = format!("Could not run docker pull: {error}");
+                    self.status_msg = Some(message.clone());
+                    self.dialog = Some(Dialog::Message { text: message });
+                    return;
+                }
+            }
+        }
+
+        self.lsp = LspClient::new(self.root_path.clone(), Some(argv));
+        match self.start_lsp_for_current_document().await {
+            Ok(true) => {
+                self.lsp_launch_mode = "docker";
+                self.status_msg = Some(format!("Docker LSP started from {image}."));
+            }
+            Ok(false) => {
+                self.lsp_launch_mode = "none";
+                let message = format!("Docker LSP did not start from {image}.");
+                self.status_msg = Some(message.clone());
+                self.dialog = Some(Dialog::Message { text: message });
+            }
+            Err(error) => {
+                self.lsp_available = false;
+                self.lsp_launch_mode = "none";
+                let detail = format!("Could not start Docker LSP from {image}: {error:#}");
+                self.status_msg = Some(detail.clone());
+                self.dialog = Some(Dialog::Message { text: detail });
+            }
         }
     }
 
@@ -2036,12 +2267,21 @@ impl App {
         lines.push(format!("$ {}", run_command.join(" ")));
         terminal.show_cursor()?;
         crossterm::terminal::disable_raw_mode()?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen, crossterm::event::DisableMouseCapture)?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+        if self.enhanced_keyboard {
+            crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+        }
         let mut process = Command::new(&run_command[0]);
         process.args(&run_command[1..]).current_dir(&root);
         let status = status_with_interrupt_guard(&mut process).await;
+        if self.enhanced_keyboard {
+            crossterm::execute!(
+                terminal.backend_mut(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            )?;
+        }
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
         terminal.clear()?;
         terminal.hide_cursor()?;
         match status {
@@ -2327,6 +2567,11 @@ fn resolve_server_command(
         }
         None => (None, "none"),
     }
+}
+
+fn docker_image_from_argv(argv: &[String]) -> Option<String> {
+    let network_index = argv.iter().position(|arg| arg == "--network")?;
+    argv.get(network_index + 2).cloned()
 }
 
 // ---------------------------------------------------------------------------

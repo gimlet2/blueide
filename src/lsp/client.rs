@@ -126,12 +126,24 @@ impl LspClient {
             .args(&cmd[1..])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn {}", cmd[0]))?;
 
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
+        let mut stderr = child.stderr.take().context("no stderr")?;
+        let stderr_output = Arc::new(Mutex::new(Vec::new()));
+        let stderr_capture = Arc::clone(&stderr_output);
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 2048];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => stderr_capture.lock().await.extend_from_slice(&chunk[..count]),
+                }
+            }
+        });
 
         // Channel for outgoing messages (app → writer task).
         let (out_tx, out_rx) = mpsc::unbounded_channel::<OutgoingMsg>();
@@ -161,11 +173,25 @@ impl LspClient {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 self.outgoing_tx.take();
-                return Err(e.context("LSP initialize failed"));
+                let detail = String::from_utf8_lossy(&stderr_output.lock().await)
+                    .trim()
+                    .to_owned();
+                return Err(if detail.is_empty() {
+                    e.context("LSP initialize failed")
+                } else {
+                    e.context(format!("LSP initialize failed: {detail}"))
+                });
             }
             Err(_) => {
                 self.outgoing_tx.take();
-                return Err(anyhow::anyhow!("LSP initialize timed out after 10 seconds"));
+                let detail = String::from_utf8_lossy(&stderr_output.lock().await)
+                    .trim()
+                    .to_owned();
+                return Err(if detail.is_empty() {
+                    anyhow::anyhow!("LSP initialize timed out after 10 seconds")
+                } else {
+                    anyhow::anyhow!("LSP initialize timed out after 10 seconds: {detail}")
+                });
             }
         }
         self.send_notification(initialized_notification()).await?;
