@@ -1,6 +1,7 @@
 //! Text editor buffer with cursor, viewport, and simple text operations.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Maximum columns to keep in the undo stack.
 const MAX_UNDO: usize = 100;
@@ -22,6 +23,7 @@ pub struct Editor {
     pub file_path: Option<PathBuf>,
     /// Whether the buffer has unsaved changes.
     pub modified: bool,
+    last_edit_at: Option<Instant>,
     selection_anchor: Option<(usize, usize)>,
     /// Simple undo history: snapshots of (lines, cursor_row, cursor_col).
     undo_stack: Vec<(Vec<String>, usize, usize)>,
@@ -39,6 +41,7 @@ impl Default for Editor {
             scroll_col: 0,
             file_path: None,
             modified: false,
+            last_edit_at: None,
             selection_anchor: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -64,6 +67,7 @@ impl Editor {
         let mut ed = Self::with_text(&text);
         ed.file_path = Some(path);
         ed.modified = false;
+        ed.last_edit_at = None;
         Ok(ed)
     }
 
@@ -74,6 +78,7 @@ impl Editor {
         })?;
         std::fs::write(path, self.text())?;
         self.modified = false;
+        self.last_edit_at = None;
         Ok(())
     }
 
@@ -82,6 +87,7 @@ impl Editor {
         std::fs::write(&path, self.text())?;
         self.file_path = Some(path);
         self.modified = false;
+        self.last_edit_at = None;
         Ok(())
     }
 
@@ -104,6 +110,18 @@ impl Editor {
         self.lines.len()
     }
 
+    /// Whether this named, modified buffer has been idle long enough to autosave.
+    pub fn autosave_due(&self, idle_for: Duration) -> bool {
+        self.modified
+            && self.file_path.is_some()
+            && self.last_edit_at.is_some_and(|last_edit| last_edit.elapsed() >= idle_for)
+    }
+
+    fn mark_modified(&mut self) {
+        self.modified = true;
+        self.last_edit_at = Some(Instant::now());
+    }
+
     /// Replace the entire buffer content with `text`.
     pub fn set_text(&mut self, text: &str) {
         self.lines = text.lines().map(String::from).collect();
@@ -115,6 +133,7 @@ impl Editor {
         self.scroll_row = 0;
         self.scroll_col = 0;
         self.modified = false;
+        self.last_edit_at = None;
         self.selection_anchor = None;
     }
 
@@ -226,7 +245,7 @@ impl Editor {
         self.cursor_row = start.0;
         self.cursor_col = start.1;
         self.selection_anchor = None;
-        self.modified = true;
+        self.mark_modified();
         true
     }
 
@@ -347,7 +366,34 @@ impl Editor {
         let byte_pos = char_to_byte(line, col);
         line.insert(byte_pos, ch);
         self.cursor_col += 1;
-        self.modified = true;
+        self.mark_modified();
+    }
+
+    /// Insert an opening delimiter and its matching closer, leaving the cursor inside.
+    pub fn insert_pair(&mut self, open: char, close: char) {
+        if self.has_selection() {
+            self.push_undo();
+            self.delete_selection_inner(false);
+        } else {
+            self.clear_selection();
+            self.push_undo();
+        }
+        let byte_pos = char_to_byte(&self.lines[self.cursor_row], self.cursor_col);
+        self.lines[self.cursor_row].insert(byte_pos, open);
+        self.lines[self.cursor_row].insert(byte_pos + open.len_utf8(), close);
+        self.cursor_col += 1;
+        self.mark_modified();
+    }
+
+    /// Insert a blank line after the current line and place the cursor at its start.
+    pub fn insert_newline_below(&mut self) {
+        self.clear_selection();
+        self.push_undo();
+        let row = self.cursor_row + 1;
+        self.lines.insert(row, String::new());
+        self.cursor_row = row;
+        self.cursor_col = 0;
+        self.mark_modified();
     }
 
     /// Insert a newline, splitting the current line at the cursor.
@@ -372,7 +418,7 @@ impl Editor {
         self.cursor_row += 1;
         self.cursor_col = indent_len;
         self.lines.insert(self.cursor_row, new_line);
-        self.modified = true;
+        self.mark_modified();
     }
 
     /// Delete the character before the cursor (Backspace).
@@ -386,7 +432,7 @@ impl Editor {
             let prev = prev_char_boundary(&self.lines[self.cursor_row], byte_pos);
             self.lines[self.cursor_row].remove(prev);
             self.cursor_col -= 1;
-            self.modified = true;
+            self.mark_modified();
         } else if self.cursor_row > 0 {
             // Join with previous line.
             let current = self.lines.remove(self.cursor_row);
@@ -394,7 +440,7 @@ impl Editor {
             let prev_len = self.lines[self.cursor_row].chars().count();
             self.lines[self.cursor_row].push_str(&current);
             self.cursor_col = prev_len;
-            self.modified = true;
+            self.mark_modified();
         }
     }
 
@@ -406,11 +452,11 @@ impl Editor {
         if self.cursor_col < self.current_line_len() {
             let byte_pos = char_to_byte(&self.lines[self.cursor_row], self.cursor_col);
             self.lines[self.cursor_row].remove(byte_pos);
-            self.modified = true;
+            self.mark_modified();
         } else if self.cursor_row + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_row + 1);
             self.lines[self.cursor_row].push_str(&next);
-            self.modified = true;
+            self.mark_modified();
         }
     }
 
@@ -436,7 +482,7 @@ impl Editor {
             self.lines = lines;
             self.cursor_row = row;
             self.cursor_col = col;
-            self.modified = true;
+            self.mark_modified();
         }
     }
 
@@ -447,7 +493,7 @@ impl Editor {
             self.lines = lines;
             self.cursor_row = row;
             self.cursor_col = col;
-            self.modified = true;
+            self.mark_modified();
         }
     }
 
@@ -503,7 +549,7 @@ impl Editor {
             self.lines[0].clear();
         }
         self.cursor_col = 0;
-        self.modified = true;
+        self.mark_modified();
         text
     }
 
@@ -537,7 +583,7 @@ impl Editor {
                 let col_char = self.lines[row][..col_byte].chars().count();
                 self.cursor_row = row;
                 self.cursor_col = col_char;
-                self.modified = true;
+                self.mark_modified();
                 return true;
             }
         }

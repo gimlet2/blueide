@@ -15,6 +15,7 @@ use app::App;
 async fn main() -> Result<()> {
     // Simple argument parsing: optional path to file or directory.
     let args: Vec<String> = std::env::args().skip(1).collect();
+
     let open_path = args.first().map(PathBuf::from);
 
     let mut application = App::new(open_path).await?;

@@ -21,6 +21,7 @@ use ratatui::{
 
 use crate::app::{App, BuildDiagnostic, CompletionState, Dialog, FocusArea, HelpLine, SettingKind, SubMenuItem, SUBMENUS};
 use crate::editor::{highlight_line_for_language, TokenKind};
+use crate::lsp::{Diagnostic, DiagnosticSeverity};
 
 // ---------------------------------------------------------------------------
 // Colour palette — authentic Turbo Pascal blue
@@ -331,6 +332,8 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .file_path
         .as_ref()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    let current_uri = app.editor.uri();
+    let diagnostics = app.diagnostics.get(&current_uri).map(Vec::as_slice).unwrap_or(&[]);
 
     // Update scroll so cursor stays visible.
     let ed = &mut app.editor;
@@ -371,6 +374,17 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
 
         let chars: Vec<char> = raw_line.chars().collect();
         let line_char_len = chars.len();
+        let row_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.range.start.line as usize <= row_idx
+                    && row_idx <= diagnostic.range.end.line as usize
+            })
+            .collect();
+        let line_severity = row_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.severity)
+            .min_by_key(|severity| diagnostic_priority(*severity));
 
         // Build visible slice of the line with syntax highlighting.
         let mut spans: Vec<Span> = Vec::new();
@@ -381,8 +395,8 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
             .and_then(|p| app.breakpoints.get(p))
             .is_some_and(|rows| rows.contains(&row_idx));
         spans.push(Span::styled(
-            if has_breakpoint { "●" } else { " " },
-            Style::default().bg(line_bg).fg(if has_breakpoint { C_RED } else { C_WHITE }),
+            line_severity.map(diagnostic_marker).unwrap_or(if has_breakpoint { '●' } else { ' ' }).to_string(),
+            Style::default().bg(line_bg).fg(line_severity.map(diagnostic_color).unwrap_or(if has_breakpoint { C_RED } else { C_WHITE })),
         ));
         spans.push(Span::styled(
             format!("{:>4} ", row_idx + 1),
@@ -392,6 +406,10 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         for col_idx in scroll_col..scroll_col + display_len {
             let is_cursor_col = is_cursor_line && col_idx == cursor_col;
             let is_selected = app.editor.is_selected(row_idx, col_idx);
+            let diagnostic_severity = row_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic_covers_char(diagnostic, row_idx, col_idx, &chars))
+                .map(|diagnostic| diagnostic.severity);
 
             if col_idx >= line_char_len {
                 // Past end of line: render cursor block or blank.
@@ -399,10 +417,17 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
                     (C_BLUE, C_WHITE) // cursor at EOL
                 } else if is_selected {
                     (C_BLACK, C_CYAN)
+                } else if let Some(severity) = diagnostic_severity {
+                    (C_BLACK, diagnostic_color(severity))
                 } else {
                     (C_WHITE, line_bg)
                 };
-                spans.push(Span::styled(" ", Style::default().bg(bg).fg(fg)));
+                let style = if diagnostic_severity.is_some() && !is_cursor_col && !is_selected {
+                    Style::default().bg(bg).fg(fg).add_modifier(Modifier::UNDERLINED)
+                } else {
+                    Style::default().bg(bg).fg(fg)
+                };
+                spans.push(Span::styled(" ", style));
             } else {
                 let ch = chars[col_idx];
                 let kind = token_kinds.get(col_idx).copied().unwrap_or(TokenKind::Normal);
@@ -425,6 +450,12 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
                     (C_BLUE, C_WHITE, Modifier::empty())
                 } else if is_selected {
                     (C_BLACK, C_CYAN, Modifier::empty())
+                } else if let Some(severity) = diagnostic_severity {
+                    (
+                        diagnostic_color(severity),
+                        line_bg,
+                        keyword_modifiers | Modifier::UNDERLINED,
+                    )
                 } else {
                     (base_fg, line_bg, keyword_modifiers)
                 };
@@ -449,6 +480,77 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         .style(Style::default().bg(C_BLUE).fg(C_WHITE));
 
     frame.render_widget(paragraph, area);
+}
+
+fn diagnostic_priority(severity: DiagnosticSeverity) -> u8 {
+    match severity {
+        DiagnosticSeverity::Error => 0,
+        DiagnosticSeverity::Warning => 1,
+        DiagnosticSeverity::Information => 2,
+        DiagnosticSeverity::Hint => 3,
+    }
+}
+
+fn diagnostic_marker(severity: DiagnosticSeverity) -> char {
+    match severity {
+        DiagnosticSeverity::Error => 'E',
+        DiagnosticSeverity::Warning => 'W',
+        DiagnosticSeverity::Information => 'i',
+        DiagnosticSeverity::Hint => 'h',
+    }
+}
+
+fn diagnostic_color(severity: DiagnosticSeverity) -> Color {
+    match severity {
+        DiagnosticSeverity::Error => C_RED,
+        DiagnosticSeverity::Warning => C_ORANGE,
+        DiagnosticSeverity::Information => C_CYAN,
+        DiagnosticSeverity::Hint => C_YELLOW,
+    }
+}
+
+fn diagnostic_covers_char(
+    diagnostic: &Diagnostic,
+    row: usize,
+    col: usize,
+    line_chars: &[char],
+) -> bool {
+    let row = row as u32;
+    if row < diagnostic.range.start.line || row > diagnostic.range.end.line {
+        return false;
+    }
+
+    let start_col = if row == diagnostic.range.start.line {
+        utf16_to_char_col(line_chars, diagnostic.range.start.character)
+    } else {
+        0
+    };
+    let mut end_col = if row == diagnostic.range.end.line {
+        utf16_to_char_col(line_chars, diagnostic.range.end.character)
+    } else {
+        line_chars.len()
+    };
+
+    // Empty LSP ranges still need a visible mark at the reported position.
+    if diagnostic.range.start.line == diagnostic.range.end.line
+        && diagnostic.range.start.character == diagnostic.range.end.character
+        && row == diagnostic.range.start.line
+    {
+        end_col = start_col.saturating_add(1);
+    }
+
+    (start_col..end_col).contains(&col)
+}
+
+fn utf16_to_char_col(chars: &[char], utf16_col: u32) -> usize {
+    let mut units = 0u32;
+    for (index, ch) in chars.iter().enumerate() {
+        if units >= utf16_col {
+            return index;
+        }
+        units = units.saturating_add(ch.len_utf16() as u32);
+    }
+    chars.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -617,12 +719,23 @@ fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, app: &App) {
             render_replace_dialog(frame, area, find, replace_with, *focus_replace);
         }
         Dialog::GoToLine { input } => render_goto_line_dialog(frame, area, input),
-        Dialog::Message { text, .. } => render_message_dialog(frame, area, text),
+        Dialog::Message { text, .. } => {
+            render_action_dialog(frame, area, " Message ", text, &["OK"]);
+        }
         Dialog::Hover { text, scroll } => render_hover_dialog(frame, area, text, *scroll),
-        Dialog::ConfirmDiscard { .. } => render_message_dialog(
+        Dialog::DockerApproval { image } => render_action_dialog(
             frame,
             area,
+            " Docker LSP ",
+            &format!("Allow BlueIDE to pull {image} if needed and run its language server?"),
+            &["Approve", "Cancel"],
+        ),
+        Dialog::ConfirmDiscard { .. } => render_action_dialog(
+            frame,
+            area,
+            " Unsaved Changes ",
             "Unsaved changes. Press Y to discard, N or Esc to cancel.",
+            &["Discard", "Cancel"],
         ),
         Dialog::BuildOutput { title, lines, diagnostics, selected } => {
             render_build_output(frame, area, title, lines, diagnostics, *selected);
@@ -632,7 +745,7 @@ fn render_dialog(frame: &mut Frame, area: Rect, dialog: &Dialog, app: &App) {
                 SettingKind::Parameters => (" Run Parameters ", "Args: "),
                 SettingKind::Compiler(_) => (" Compiler Command ", "Command: "),
             };
-            render_input_dialog(frame, area, title, input, label, 60);
+            render_input_dialog(frame, area, title, input, label, 60, &["Save", "Cancel"]);
         }
     }
 }
@@ -652,7 +765,7 @@ fn render_build_output(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_CYAN))
         .style(Style::default().bg(C_BLUE).fg(C_WHITE));
-    let body_height = popup.height.saturating_sub(2) as usize;
+    let body_height = popup.height.saturating_sub(3) as usize;
     let selected_line = diagnostics.get(selected).map(|d| d.output_line).unwrap_or(0);
     let start = if diagnostics.is_empty() {
         selected.min(output.len().saturating_sub(body_height))
@@ -679,6 +792,16 @@ fn render_build_output(
     if output.is_empty() {
         lines.push(Line::from("(no output)"));
     }
+    lines.resize_with(body_height, || Line::from(""));
+    let close_width = " Close ".chars().count();
+    let left_pad = popup.width.saturating_sub(2) as usize;
+    lines.push(Line::from(vec![
+        Span::raw(" ".repeat(left_pad.saturating_sub(close_width) / 2)),
+        Span::styled(
+            " Close ",
+            Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD),
+        ),
+    ]));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -703,6 +826,7 @@ fn render_help_dialog(frame: &mut Frame, area: Rect) {
         HelpLine { key: "Ctrl+Q / Alt+F4",     action: "Quit" },
         HelpLine { key: "Ctrl+Z / Ctrl+Y",     action: "Undo / Redo" },
         HelpLine { key: "Ctrl+X / Ins / Shift+Ins", action: "Cut / Copy / Paste" },
+        HelpLine { key: "Shift+Enter / Ctrl+J", action: "Insert blank line below" },
         HelpLine { key: "Shift+Arrow / Ctrl+A", action: "Select / Select all" },
         HelpLine { key: "Ctrl+Tab / Ctrl+PgUp/Dn", action: "Cycle open buffers" },
         HelpLine { key: "Ctrl+1..9 / Mouse",   action: "Jump to buffer / click UI" },
@@ -747,15 +871,15 @@ fn render_help_dialog(frame: &mut Frame, area: Rect) {
 }
 
 fn render_open_file_dialog(frame: &mut Frame, area: Rect, input: &str) {
-    render_input_dialog(frame, area, " Open File ", input, "Path: ", 50);
+    render_input_dialog(frame, area, " Open File ", input, "Path: ", 50, &["Open", "Cancel"]);
 }
 
 fn render_save_as_dialog(frame: &mut Frame, area: Rect, input: &str) {
-    render_input_dialog(frame, area, " Save As ", input, "Path: ", 50);
+    render_input_dialog(frame, area, " Save As ", input, "Path: ", 50, &["Save", "Cancel"]);
 }
 
 fn render_find_dialog(frame: &mut Frame, area: Rect, input: &str) {
-    render_input_dialog(frame, area, " Find ", input, "Search: ", 40);
+    render_input_dialog(frame, area, " Find ", input, "Search: ", 40, &["Find", "Cancel"]);
 }
 
 fn render_input_dialog(
@@ -765,21 +889,31 @@ fn render_input_dialog(
     input: &str,
     label: &str,
     width: u16,
+    buttons: &[&str],
 ) {
-    let popup = dialog_centered(area, width, 5);
+    let popup = dialog_centered(area, width, 6);
     frame.render_widget(Clear, popup);
 
     let display = format!("{label}{input}_");
+    let inner_width = popup.width.saturating_sub(2) as usize;
+    let button_width: usize = buttons.iter().map(|label| label.chars().count() + 2).sum::<usize>()
+        + buttons.len().saturating_sub(1) * 2;
+    let mut button_spans = vec![Span::raw(" ".repeat(inner_width.saturating_sub(button_width) / 2))];
+    for (index, label) in buttons.iter().enumerate() {
+        if index > 0 { button_spans.push(Span::raw("  ")); }
+        button_spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD),
+        ));
+    }
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("  {display}"),
             Style::default().bg(C_GRAY).fg(C_BLACK),
         )),
-        Line::from(Span::styled(
-            "  [Enter] confirm   [Esc] cancel",
-            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
-        )),
+        Line::from(""),
+        Line::from(button_spans),
     ];
 
     let block = Block::default()
@@ -795,34 +929,114 @@ fn render_input_dialog(
     frame.render_widget(para, popup);
 }
 
-fn render_message_dialog(frame: &mut Frame, area: Rect, text: &str) {
-    let width = (text.len() as u16 + 8).max(30).min(60);
-    let popup = dialog_centered(area, width, 5);
+fn render_action_dialog(frame: &mut Frame, area: Rect, title: &str, text: &str, buttons: &[&str]) {
+    let button_width: usize = buttons.iter().map(|label| label.chars().count() + 2).sum::<usize>()
+        + buttons.len().saturating_sub(1) * 2;
+    let width = area.width.saturating_sub(4).min(80).max(30);
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let wrapped_lines: usize = text
+        .lines()
+        .map(|line| line.chars().count().max(1).div_ceil(inner_width))
+        .sum();
+    let height = (wrapped_lines.max(1) as u16 + 5)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
     frame.render_widget(Clear, popup);
 
+    let mut button_spans = vec![Span::raw(" ".repeat((inner_width.saturating_sub(button_width)) / 2))];
+    for (index, label) in buttons.iter().enumerate() {
+        if index > 0 {
+            button_spans.push(Span::raw("  "));
+        }
+        button_spans.push(Span::styled(
+            format!(" {label} "),
+            Style::default().bg(C_CYAN).fg(C_BLACK).add_modifier(Modifier::BOLD),
+        ));
+    }
     let lines = vec![
+        Line::from(Span::styled(text, Style::default().bg(C_GRAY).fg(C_BLACK))),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().bg(C_GRAY).fg(C_BLACK),
-        )),
-        Line::from(Span::styled(
-            "  [Enter / Esc] close",
-            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
-        )),
+        Line::from(""),
+        Line::from(button_spans),
     ];
 
+    let footer = if buttons.len() == 1 {
+        " Enter / Esc close "
+    } else {
+        " Enter/Y confirm  Esc/N cancel "
+    };
     let block = Block::default()
-        .title(Span::styled(
-            " Message ",
-            Style::default().bg(C_CYAN).fg(C_BLACK),
+        .title(Span::styled(title, Style::default().bg(C_CYAN).fg(C_BLACK)))
+        .title_bottom(Span::styled(
+            footer,
+            Style::default().bg(C_GRAY).fg(C_DARK_GRAY),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(C_GRAY))
         .style(Style::default().bg(C_GRAY));
 
-    let para = Paragraph::new(lines).block(block);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
     frame.render_widget(para, popup);
+}
+
+pub(crate) fn dialog_button_at(dialog: &Dialog, area: Rect, x: u16, y: u16) -> Option<usize> {
+    let (buttons, width, height, text) = match dialog {
+        Dialog::Message { text } => (&["OK"][..], area.width.saturating_sub(4).min(80).max(30), 0, Some(text.clone())),
+        Dialog::DockerApproval { image } => (
+            &["Approve", "Cancel"][..],
+            area.width.saturating_sub(4).min(80).max(30),
+            0,
+            Some(format!("Allow BlueIDE to pull {image} if needed and run its language server?")),
+        ),
+        Dialog::ConfirmDiscard { .. } => (
+            &["Discard", "Cancel"][..],
+            area.width.saturating_sub(4).min(80).max(30),
+            0,
+            Some("Unsaved changes. Press Y to discard, N or Esc to cancel.".into()),
+        ),
+        Dialog::OpenFile { .. } => (&["Open", "Cancel"][..], 50, 6, None),
+        Dialog::SaveAs { .. } => (&["Save", "Cancel"][..], 50, 6, None),
+        Dialog::Find { .. } => (&["Find", "Cancel"][..], 40, 6, None),
+        Dialog::GoToLine { .. } => (&["Go", "Cancel"][..], 30, 6, None),
+        Dialog::SettingsInput { .. } => (&["Save", "Cancel"][..], 60, 6, None),
+        Dialog::BuildOutput { .. } => (
+            &["Close"][..],
+            area.width.saturating_sub(8),
+            area.height.saturating_sub(4),
+            None,
+        ),
+        _ => return None,
+    };
+    let button_width: usize = buttons.iter().map(|label| label.chars().count() + 2).sum::<usize>()
+        + buttons.len().saturating_sub(1) * 2;
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let height = if let Some(text) = text {
+        let wrapped_lines: usize = text
+            .lines()
+            .map(|line| line.chars().count().max(1).div_ceil(inner_width))
+            .sum();
+        (wrapped_lines.max(1) as u16 + 5)
+            .min(area.height.saturating_sub(2))
+            .max(5)
+    } else {
+        height
+    };
+    let popup = dialog_centered(area, width.min(area.width), height.min(area.height));
+    let button_row = popup.y.saturating_add(popup.height.saturating_sub(2));
+    if y != button_row {
+        return None;
+    }
+    let mut button_x = popup.x.saturating_add(1)
+        .saturating_add((inner_width.saturating_sub(button_width) / 2) as u16);
+    for (index, label) in buttons.iter().enumerate() {
+        let end_x = button_x.saturating_add(label.chars().count() as u16 + 2);
+        if (button_x..end_x).contains(&x) {
+            return Some(index);
+        }
+        button_x = end_x.saturating_add(2);
+    }
+    None
 }
 
 fn render_hover_dialog(frame: &mut Frame, area: Rect, text: &str, scroll: u16) {
@@ -908,7 +1122,7 @@ fn render_replace_dialog(
 }
 
 fn render_goto_line_dialog(frame: &mut Frame, area: Rect, input: &str) {
-    render_input_dialog(frame, area, " Go to Line ", input, "Line: ", 30);
+    render_input_dialog(frame, area, " Go to Line ", input, "Line: ", 30, &["Go", "Cancel"]);
 }
 
 fn render_about_dialog(frame: &mut Frame, area: Rect, app: &App) {
